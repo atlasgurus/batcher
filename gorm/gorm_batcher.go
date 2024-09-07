@@ -2,6 +2,8 @@ package gorm
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/atlasgurus/batcher/batcher"
@@ -69,17 +71,32 @@ func batchUpdate[T any](db *gorm.DB, updateFields []string) func([]T) error {
 			return tx.Error
 		}
 
+		// Create a map to hold the updates for each field
+		updates := make(map[string]interface{})
+		for _, field := range updateFields {
+			updates[field] = gorm.Expr("CASE")
+		}
+
+		// Iterate over the items and populate the map with the updates
 		for _, item := range items {
-			query := tx.Model(item)
-			if len(updateFields) > 0 {
-				query = query.Select(updateFields)
-			}
-			if err := query.Updates(item).Error; err != nil {
-				tx.Rollback()
-				return err
+			for _, field := range updateFields {
+				value := reflect.ValueOf(item).FieldByName(field).Interface()
+				updates[field] = gorm.Expr(fmt.Sprintf("%s WHEN id = ? THEN ?", updates[field]), item.ID, value)
 			}
 		}
 
+		// Construct a single update query using the map
+		for field, expr := range updates {
+			updates[field] = gorm.Expr(fmt.Sprintf("%s ELSE %s END", expr, field))
+		}
+
+		// Execute the update query
+		if err := tx.Model(&items[0]).Updates(updates).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		// Commit the transaction
 		return tx.Commit().Error
 	}
 }
