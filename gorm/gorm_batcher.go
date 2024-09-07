@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/atlasgurus/batcher/batcher"
@@ -71,40 +72,69 @@ func batchUpdate[T any](db *gorm.DB, updateFields []string) func([]T) error {
 			return tx.Error
 		}
 
-		// Create a map to hold the updates for each field
-		updates := make(map[string]interface{})
-		for _, field := range updateFields {
-			updates[field] = gorm.Expr("CASE")
-		}
-
-		// Iterate over the items and populate the map with the updates
 		for _, item := range items {
-			itemValue := reflect.ValueOf(item)
-			idValue := itemValue.FieldByName("ID")
-			if !idValue.IsValid() {
+			// Get the primary key field and value
+			primaryKey, primaryKeyValue := getPrimaryKeyAndValue(item)
+			if primaryKey == "" {
 				tx.Rollback()
-				return fmt.Errorf("item does not have an ID field")
+				return fmt.Errorf("primary key not found for item")
 			}
-			id := idValue.Interface()
 
-			for _, field := range updateFields {
-				value := itemValue.FieldByName(field).Interface()
-				updates[field] = gorm.Expr(fmt.Sprintf("%s WHEN id = ? THEN ?", updates[field]), id, value)
+			// Create a map of fields to update
+			updateMap := make(map[string]interface{})
+			v := reflect.ValueOf(item)
+			t := v.Type()
+			if t.Kind() == reflect.Ptr {
+				v = v.Elem()
+				t = v.Type()
+			}
+
+			for i := 0; i < t.NumField(); i++ {
+				field := t.Field(i)
+				if len(updateFields) == 0 || contains(updateFields, field.Name) {
+					updateMap[field.Name] = v.Field(i).Interface()
+				}
+			}
+
+			// Perform the update
+			result := tx.Model(new(T)).Where(primaryKey+" = ?", primaryKeyValue).Updates(updateMap)
+			if result.Error != nil {
+				tx.Rollback()
+				return result.Error
 			}
 		}
 
-		// Construct a single update query using the map
-		for field, expr := range updates {
-			updates[field] = gorm.Expr(fmt.Sprintf("%s ELSE %s END", expr, field))
-		}
-
-		// Execute the update query
-		if err := tx.Model(&items[0]).Updates(updates).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
-
-		// Commit the transaction
 		return tx.Commit().Error
 	}
+}
+
+// Helper function to check if a string is in a slice
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// getPrimaryKeyAndValue uses reflection to find the primary key field and its value
+func getPrimaryKeyAndValue(item interface{}) (string, interface{}) {
+	t := reflect.TypeOf(item)
+	v := reflect.ValueOf(item)
+
+	// If it's a pointer, get the underlying element
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+		v = v.Elem()
+	}
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if tag := field.Tag.Get("gorm"); strings.Contains(tag, "primaryKey") {
+			return field.Name, v.Field(i).Interface()
+		}
+	}
+
+	return "", nil
 }
