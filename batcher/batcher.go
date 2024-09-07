@@ -96,3 +96,5 @@ func (bp *BatchProcessor[T]) run() {
 		}
 	}
 }
+
+// dummy changes to test the workflow
