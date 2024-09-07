@@ -79,9 +79,17 @@ func batchUpdate[T any](db *gorm.DB, updateFields []string) func([]T) error {
 
 		// Iterate over the items and populate the map with the updates
 		for _, item := range items {
+			itemValue := reflect.ValueOf(item)
+			idValue := itemValue.FieldByName("ID")
+			if !idValue.IsValid() {
+				tx.Rollback()
+				return fmt.Errorf("item does not have an ID field")
+			}
+			id := idValue.Interface()
+
 			for _, field := range updateFields {
-				value := reflect.ValueOf(item).FieldByName(field).Interface()
-				updates[field] = gorm.Expr(fmt.Sprintf("%s WHEN id = ? THEN ?", updates[field]), item.ID, value)
+				value := itemValue.FieldByName(field).Interface()
+				updates[field] = gorm.Expr(fmt.Sprintf("%s WHEN id = ? THEN ?", updates[field]), id, value)
 			}
 		}
 
