@@ -6,7 +6,6 @@ import (
 	"os"
 	"sync"
 	"testing"
-	"time"
 
 	gormv1 "github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/mysql"
@@ -60,7 +59,7 @@ func TestInsertBatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewInsertBatcher[*TestModel](db, 3, 100*time.Millisecond, ctx)
+	batcher := NewInsertBatcher[*TestModel](db, 3, 100, ctx)
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
@@ -81,7 +80,7 @@ func TestUpdateBatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewUpdateBatcher[*TestModel](db, 3, 100*time.Millisecond, ctx, []string{"Value"})
+	batcher := NewUpdateBatcher[*TestModel](db, 3, 100, ctx, []string{"Value"})
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
@@ -117,8 +116,8 @@ func TestConcurrentOperations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	insertBatcher := NewInsertBatcher[*TestModel](db, 10, 100*time.Millisecond, ctx)
-	updateBatcher := NewUpdateBatcher[*TestModel](db, 10, 100*time.Millisecond, ctx, nil)
+	insertBatcher := NewInsertBatcher[*TestModel](db, 10, 100, ctx)
+	updateBatcher := NewUpdateBatcher[*TestModel](db, 10, 100, ctx, nil)
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
