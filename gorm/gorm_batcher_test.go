@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	gormv1 "github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/mysql"
@@ -19,19 +20,35 @@ type TestModel struct {
 	Value int    `gorm:"type:int"`
 }
 
-var db *gormv2.DB
+var (
+	db      *gormv2.DB
+	dialect string
+)
 
 func TestMain(m *testing.M) {
-	// Get the DSN from environment variable
+	// Get the DSN and dialect from environment variables
 	dsn := os.Getenv("DSN")
+	dialect = os.Getenv("DIALECT")
 	if dsn == "" {
-		panic("DSN environment variable is not set")
+		panic("DSN environment variable must be set")
+	}
+	if dialect == "" {
+		dialect = "mysql" // Default to MySQL if DIALECT is not set
 	}
 
-	// Open a GORM v1 connection
-	v1DB, err := gormv1.Open("mysql", dsn)
+	var err error
+	var v1DB *gormv1.DB
+
+	// Open a GORM v1 connection based on the dialect
+	switch dialect {
+	case "mysql", "postgres", "sqlite3":
+		v1DB, err = gormv1.Open(dialect, dsn)
+	default:
+		panic("Unsupported dialect: " + dialect)
+	}
+
 	if err != nil {
-		panic("failed to connect database using GORM v1")
+		panic(fmt.Sprintf("failed to connect database: %v", err))
 	}
 
 	// Convert to GORM v2
@@ -59,7 +76,7 @@ func TestInsertBatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewInsertBatcher[*TestModel](db, 3, 100, ctx)
+	batcher := NewInsertBatcher[*TestModel](db, 3, 100*time.Millisecond, ctx)
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
@@ -80,7 +97,7 @@ func TestUpdateBatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewUpdateBatcher[*TestModel](db, 3, 100, ctx, []string{"Value"})
+	batcher := NewUpdateBatcher[*TestModel](db, 3, 100*time.Millisecond, ctx, []string{"Value"})
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
@@ -116,8 +133,8 @@ func TestConcurrentOperations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	insertBatcher := NewInsertBatcher[*TestModel](db, 10, 100, ctx)
-	updateBatcher := NewUpdateBatcher[*TestModel](db, 10, 100, ctx, nil)
+	insertBatcher := NewInsertBatcher[*TestModel](db, 10, 100*time.Millisecond, ctx)
+	updateBatcher := NewUpdateBatcher[*TestModel](db, 10, 100*time.Millisecond, ctx, nil)
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
