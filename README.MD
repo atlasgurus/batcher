@@ -13,13 +13,15 @@ AtlasGurus Batcher is a Go module that provides efficient batching functionality
 - Support for both GORM v1 and v2
 - Concurrent operation support
 - Type-safe implementations using Go generics
+- Support for composite primary keys
+- Dynamic database connection handling
 
 ## Installation
 
 To install AtlasGurus Batcher, use `go get`:
 
-```
-go get atlasgurus/batcher
+```sh
+go get github.com/atlasgurus/batcher
 ```
 
 ## Usage
@@ -32,7 +34,7 @@ The `batcher` package provides a generic batching mechanism that can be used for
 import (
     "context"
     "time"
-    "atlasgurus/batcher"
+    "github.com/atlasgurus/batcher/batcher"
 )
 
 // Create a new batch processor
@@ -46,7 +48,7 @@ processor := batcher.NewBatchProcessor(
     },
 )
 
-// Submit items for processing
+// Submit an item for processing
 err := processor.SubmitAndWait(item)
 if err != nil {
     // Handle error
@@ -61,27 +63,30 @@ The `gorm` package provides GORM-specific batching for insert and update operati
 import (
     "context"
     "time"
-    "atlasgurus/batcher/gorm"
+    "github.com/atlasgurus/batcher/gorm"
     "gorm.io/gorm"
 )
 
-// Assuming you have a GORM v2 DB instance
-db, _ := gorm.Open(...)
+// Define a database provider function
+dbProvider := func() (*gorm.DB, error) {
+    // Your logic to get the current active database connection
+    return getCurrentDBConnection()
+}
 
 // Create an insert batcher
-insertBatcher := gorm.NewInsertBatcher[*YourModel](db, 100, 5*time.Second, context.Background())
+insertBatcher := gorm.NewInsertBatcher[*YourModel](dbProvider, 100, 5*time.Second, context.Background())
 
 // Use the insert batcher
-err := insertBatcher.Insert(&YourModel{...})
+err := insertBatcher.Insert(&YourModel{...}, &YourModel{...})
 if err != nil {
     // Handle error
 }
 
 // Create an update batcher
-updateBatcher := gorm.NewUpdateBatcher[*YourModel](db, 100, 5*time.Second, context.Background(), []string{"FieldToUpdate"})
+updateBatcher := gorm.NewUpdateBatcher[*YourModel](dbProvider, 100, 5*time.Second, context.Background())
 
 // Use the update batcher
-err = updateBatcher.Update(&YourModel{...})
+err = updateBatcher.Update([*]YourModel{...}, []string{"FieldToUpdate"})
 if err != nil {
     // Handle error
 }
@@ -94,7 +99,7 @@ If you're using GORM v1, you can use the provided adapter to convert your v1 con
 ```go
 import (
     gormv1 "github.com/jinzhu/gorm"
-    "atlasgurus/batcher/gorm"
+    "github.com/atlasgurus/batcher/gorm"
 )
 
 // Open a GORM v1 connection
@@ -121,11 +126,10 @@ v2DB, _ := gorm.GormV1ToV2Adapter(v1DB)
 
 Both `NewInsertBatcher` and `NewUpdateBatcher` take the following parameters:
 
-- `db`: A GORM v2 database instance
+- `dbProvider`: A function that returns a GORM v2 database instance and an error
 - `maxBatchSize`: The maximum number of items to include in a single batch
 - `maxWaitTime`: The maximum time to wait before processing a batch
 - `ctx`: A context for cancellation
-- `updateFields` (for update batcher only): An optional list of fields to update
 
 ## Contributing
 
