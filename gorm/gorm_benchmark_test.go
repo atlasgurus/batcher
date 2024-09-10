@@ -68,7 +68,7 @@ func BenchmarkGORMBatcher(b *testing.B) {
 	expectedCount := int64(numRoutines * operationsPerRoutine / 2) // Half of operations are inserts
 
 	var sumValue int64
-	db.Model(&TestModel{}).Select("SUM(value)").Row().Scan(&sumValue)
+	db.Model(&TestModel{}).Select("SUM(my_value)").Row().Scan(&sumValue)
 
 	// Calculate expected sum
 	expectedSum := int64(0)
