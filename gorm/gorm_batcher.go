@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/atlasgurus/batcher/batcher"
 	"gorm.io/gorm"
@@ -107,7 +108,7 @@ func batchUpdate[T any](dbProvider DBProvider) func([][]UpdateItem[T]) error {
 		for _, batch := range batches {
 			for _, updateItem := range batch {
 				item := updateItem.Item
-				updateFields := updateItem.UpdateFields
+				updateFields := convertFromSnakeCase(updateItem.UpdateFields)
 
 				primaryKeys, primaryKeyValues := getPrimaryKeyAndValues(item)
 				if len(primaryKeys) == 0 {
@@ -123,11 +124,17 @@ func batchUpdate[T any](dbProvider DBProvider) func([][]UpdateItem[T]) error {
 					t = v.Type()
 				}
 
+				fieldMatchCount := 0
 				for i := 0; i < t.NumField(); i++ {
 					field := t.Field(i)
 					if len(updateFields) == 0 || contains(updateFields, field.Name) {
 						updateMap[field.Name] = v.Field(i).Interface()
+						fieldMatchCount++
 					}
+				}
+				if fieldMatchCount != len(updateFields) && len(updateFields) > 0 {
+					tx.Rollback()
+					return fmt.Errorf("not all update fields found")
 				}
 
 				query := tx.Model(new(T))
@@ -146,10 +153,31 @@ func batchUpdate[T any](dbProvider DBProvider) func([][]UpdateItem[T]) error {
 	}
 }
 
+func convertFromSnakeCase(fields []string) []string {
+	convertedFields := make([]string, len(fields))
+	for i, field := range fields {
+		convertedFields[i] = toPascalCase(field)
+	}
+	return convertedFields
+}
+
+func toPascalCase(s string) string {
+	parts := strings.Split(s, "_")
+	for i, part := range parts {
+		if len(part) > 0 {
+			r := []rune(part)
+			r[0] = unicode.ToUpper(r[0])
+			parts[i] = string(r)
+		}
+	}
+	return strings.Join(parts, "")
+}
+
 // Helper function to check if a string is in a slice
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
-		if s == item {
+		// TODO: This is case-insensitive for now, but we may want to make it more nuanced
+		if strings.ToLower(s) == strings.ToLower(item) {
 			return true
 		}
 	}
@@ -172,7 +200,7 @@ func getPrimaryKeyAndValues(item interface{}) ([]string, []interface{}) {
 
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		if tag := field.Tag.Get("gorm"); strings.Contains(tag, "primaryKey") {
+		if tag := field.Tag.Get("gorm"); strings.Contains(tag, "primaryKey") || strings.Contains(tag, "primary_key") {
 			keys = append(keys, field.Name)
 			values = append(values, v.Field(i).Interface())
 		}

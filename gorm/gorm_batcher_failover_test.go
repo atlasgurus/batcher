@@ -32,7 +32,7 @@ func TestBatcherWithFailover(t *testing.T) {
 
 	// Try to insert items (this should fail twice and then succeed)
 	for i := 1; i <= 5; i++ {
-		err := batcher.Insert(&TestModel{Name: fmt.Sprintf("Test %d", i), Value: i})
+		err := batcher.Insert(&TestModel{Name: fmt.Sprintf("Test %d", i), MyValue: i})
 		if i <= 2 {
 			assert.Error(t, err, "Expected error for first two insertions")
 			assert.Contains(t, err.Error(), "simulated connection failure")
@@ -51,7 +51,7 @@ func TestBatcherWithFailover(t *testing.T) {
 	assert.Len(t, insertedModels, 3)
 	for i, model := range insertedModels {
 		assert.Equal(t, fmt.Sprintf("Test %d", i+3), model.Name)
-		assert.Equal(t, i+3, model.Value)
+		assert.Equal(t, i+3, model.MyValue)
 	}
 }
 
@@ -77,18 +77,18 @@ func TestUpdateBatcherWithFailover(t *testing.T) {
 
 	// Insert initial data
 	initialModels := []*TestModel{
-		{Name: "Initial 1", Value: 10},
-		{Name: "Initial 2", Value: 20},
-		{Name: "Initial 3", Value: 30},
-		{Name: "Initial 4", Value: 40},
-		{Name: "Initial 5", Value: 50},
+		{Name: "Initial 1", MyValue: 10},
+		{Name: "Initial 2", MyValue: 20},
+		{Name: "Initial 3", MyValue: 30},
+		{Name: "Initial 4", MyValue: 40},
+		{Name: "Initial 5", MyValue: 50},
 	}
 	db.Create(&initialModels)
 
 	// Try to update items (this should fail twice and then succeed)
 	for i := 0; i < 5; i++ {
-		initialModels[i].Value += 5
-		err := batcher.Update([]*TestModel{initialModels[i]}, []string{"Value"})
+		initialModels[i].MyValue += 5
+		err := batcher.Update([]*TestModel{initialModels[i]}, []string{"MyValue"})
 		if i < 2 {
 			assert.Error(t, err, "Expected error for first two updates")
 			assert.Contains(t, err.Error(), "simulated connection failure")
@@ -103,9 +103,9 @@ func TestUpdateBatcherWithFailover(t *testing.T) {
 	assert.Len(t, updatedModels, 5)
 	for i, model := range updatedModels {
 		if i < 2 {
-			assert.Equal(t, initialModels[i].Value-5, model.Value, "First two items should not have been updated")
+			assert.Equal(t, initialModels[i].MyValue-5, model.MyValue, "First two items should not have been updated")
 		} else {
-			assert.Equal(t, initialModels[i].Value, model.Value, "Last three items should have been updated")
+			assert.Equal(t, initialModels[i].MyValue, model.MyValue, "Last three items should have been updated")
 		}
 		assert.Equal(t, fmt.Sprintf("Initial %d", i+1), model.Name)
 	}

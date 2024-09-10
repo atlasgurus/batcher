@@ -15,7 +15,7 @@ func BenchmarkGORMBatcher(b *testing.B) {
 	// Configuration
 	numRoutines := 100
 	operationsPerRoutine := 100
-	maxBatchSize := 100
+	maxBatchSize := 60
 	maxWaitTime := 1 * time.Millisecond
 
 	// Create batchers
@@ -39,7 +39,7 @@ func BenchmarkGORMBatcher(b *testing.B) {
 				if j%2 == 0 { // Even operations are inserts
 					// Insert
 					id := routineID*operationsPerRoutine + j/2 + 1
-					model := &TestModel{ID: uint(id), Name: fmt.Sprintf("Test %d-%d", routineID, j), Value: j}
+					model := &TestModel{ID: uint(id), Name: fmt.Sprintf("Test %d-%d", routineID, j), MyValue: j}
 					err := insertBatcher.Insert(model)
 					if err != nil {
 						b.Logf("Insert error: %v", err)
@@ -47,8 +47,8 @@ func BenchmarkGORMBatcher(b *testing.B) {
 				} else { // Odd operations are updates
 					// Update
 					id := routineID*operationsPerRoutine + j/2 + 1
-					model := &TestModel{ID: uint(id), Value: j * 10}
-					err := updateBatcher.Update([]*TestModel{model}, []string{"Value"})
+					model := &TestModel{ID: uint(id), MyValue: j * 10}
+					err := updateBatcher.Update([]*TestModel{model}, []string{"my_value"})
 					if err != nil {
 						b.Logf("Update error: %v", err)
 					}
