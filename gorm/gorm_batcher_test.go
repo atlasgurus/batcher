@@ -137,7 +137,8 @@ func TestUpdateBatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
@@ -163,7 +164,7 @@ func TestUpdateBatcher(t *testing.T) {
 	for i := 3; i < 5; i++ {
 		initialModels[i].MyValue += 10
 	}
-	err := batcher.Update([]*TestModel{initialModels[3], initialModels[4]}, []string{"my_value"})
+	err = batcher.Update([]*TestModel{initialModels[3], initialModels[4]}, []string{"my_value"})
 	assert.NoError(t, err)
 
 	// Check if all items were updated correctly
@@ -184,7 +185,8 @@ func TestUpdateBatcherBadInput(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
@@ -196,8 +198,8 @@ func TestUpdateBatcherBadInput(t *testing.T) {
 	db.Create(&initialModels)
 
 	initialModels[0].MyValue += 5
-	err := batcher.Update([]*TestModel{initialModels[0]}, []string{"MyValue", "NonExistentField"})
-	assert.ErrorContains(t, err, "not all update fields found")
+	err = batcher.Update([]*TestModel{initialModels[0]}, []string{"MyValue", "NonExistentField"})
+	assert.ErrorContains(t, err, "field NonExistentField not found")
 }
 
 func TestConcurrentOperations(t *testing.T) {
@@ -205,7 +207,8 @@ func TestConcurrentOperations(t *testing.T) {
 	defer cancel()
 
 	insertBatcher := NewInsertBatcher[*TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
-	updateBatcher := NewUpdateBatcher[*TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
+	updateBatcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
 
 	// Clean up the table before the test
 	db.Exec("DELETE FROM test_models")
@@ -258,7 +261,8 @@ func TestUpdateBatcher_AllFields(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
 
 	db.Exec("DELETE FROM test_models")
 
@@ -278,7 +282,7 @@ func TestUpdateBatcher_AllFields(t *testing.T) {
 		}
 	}
 
-	err := batcher.Update(updatedModels, nil) // Update all fields
+	err = batcher.Update(updatedModels, nil) // Update all fields
 	assert.NoError(t, err)
 
 	var finalModels []TestModel
@@ -295,7 +299,8 @@ func TestUpdateBatcher_SpecificFields(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
 
 	db.Exec("DELETE FROM test_models")
 
@@ -315,7 +320,7 @@ func TestUpdateBatcher_SpecificFields(t *testing.T) {
 		}
 	}
 
-	err := batcher.Update(updatedModels, []string{"MyValue"})
+	err = batcher.Update(updatedModels, []string{"MyValue"})
 	assert.NoError(t, err)
 
 	var finalModels []TestModel
@@ -332,7 +337,8 @@ func TestUpdateBatcher_CompositeKey(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	batcher := NewUpdateBatcher[*CompositeKeyModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	batcher, err := NewUpdateBatcher[*CompositeKeyModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
 
 	db.Exec("DELETE FROM composite_key_models")
 
@@ -353,7 +359,7 @@ func TestUpdateBatcher_CompositeKey(t *testing.T) {
 		}
 	}
 
-	err := batcher.Update(updatedModels, []string{"Name", "MyValue"})
+	err = batcher.Update(updatedModels, []string{"Name", "MyValue"})
 	assert.NoError(t, err)
 
 	var finalModels []CompositeKeyModel

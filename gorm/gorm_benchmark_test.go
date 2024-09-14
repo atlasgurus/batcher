@@ -20,7 +20,10 @@ func BenchmarkGORMBatcher(b *testing.B) {
 
 	// Create batchers
 	insertBatcher := NewInsertBatcher[*TestModel](getDBProvider(), maxBatchSize, maxWaitTime, ctx)
-	updateBatcher := NewUpdateBatcher[*TestModel](getDBProvider(), maxBatchSize, maxWaitTime, ctx)
+	updateBatcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), maxBatchSize, maxWaitTime, ctx)
+	if err != nil {
+		b.Fatalf("Failed to create update batcher: %v", err)
+	}
 
 	// Clean up the table before the benchmark
 	db.Exec("DELETE FROM test_models")
