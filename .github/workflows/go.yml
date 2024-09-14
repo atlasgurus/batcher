@@ -36,7 +36,7 @@ jobs:
       - name: Run Benchmark
         run: |
           set +e
-          go test -v -bench=BenchmarkGORMBatcher -benchtime=30s ./... > benchmark_output.txt 2>&1
+          go test -v -bench=BenchmarkGORMBatcher -benchtime=20s ./... > benchmark_output.txt 2>&1
           TEST_EXIT_CODE=$?
           cat benchmark_output.txt
           if [ $TEST_EXIT_CODE -ne 0 ]; then
@@ -85,7 +85,7 @@ jobs:
       - name: Run Benchmark
         run: |
           set +e
-          go test -v -bench=BenchmarkGORMBatcher -benchtime=30s ./... > benchmark_output.txt 2>&1
+          go test -v -bench=BenchmarkGORMBatcher -benchtime=20s ./... > benchmark_output.txt 2>&1
           TEST_EXIT_CODE=$?
           cat benchmark_output.txt
           if [ $TEST_EXIT_CODE -ne 0 ]; then
@@ -129,7 +129,7 @@ jobs:
       - name: Run Benchmark
         run: |
           set +e
-          go test -v -bench=BenchmarkGORMBatcher -benchtime=30s ./... > benchmark_output.txt 2>&1
+          go test -v -bench=BenchmarkGORMBatcher -benchtime=20s ./... > benchmark_output.txt 2>&1
           TEST_EXIT_CODE=$?
           cat benchmark_output.txt
           if [ $TEST_EXIT_CODE -ne 0 ]; then
