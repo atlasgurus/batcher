@@ -209,19 +209,20 @@ func batchUpdate[T any](
 					updateFields = append(updateFields, dbFieldName)
 				}
 
-				caseStmt := "WHEN "
+				var caseBuilder strings.Builder
+				caseBuilder.WriteString("WHEN ")
 				var caseValues []interface{}
 				for i, pkField := range primaryKeyFields {
 					if i > 0 {
-						caseStmt += " AND "
+						caseBuilder.WriteString(" AND ")
 					}
-					caseStmt += fmt.Sprintf("%s = ?", primaryKeyNames[i])
+					caseBuilder.WriteString(fmt.Sprintf("%s = ?", primaryKeyNames[i]))
 					caseValues = append(caseValues, itemValue.FieldByName(pkField.Name).Interface())
 				}
-				caseStmt += " THEN ?"
+				caseBuilder.WriteString(" THEN ?")
 				caseValues = append(caseValues, itemValue.FieldByName(structFieldName).Interface())
 
-				casesPerField[dbFieldName] = append(casesPerField[dbFieldName], caseStmt)
+				casesPerField[dbFieldName] = append(casesPerField[dbFieldName], caseBuilder.String())
 				valuesPerField[dbFieldName] = append(valuesPerField[dbFieldName], caseValues...)
 			}
 		}
@@ -230,24 +231,25 @@ func batchUpdate[T any](
 			return fmt.Errorf("no fields to update")
 		}
 
-		query := fmt.Sprintf("UPDATE %s SET ", tableName)
+		var queryBuilder strings.Builder
+		queryBuilder.WriteString(fmt.Sprintf("UPDATE %s SET ", tableName))
 		var allValues []interface{}
 
 		for i, field := range updateFields {
 			if i > 0 {
-				query += ", "
+				queryBuilder.WriteString(", ")
 			}
-			query += fmt.Sprintf("%s = CASE %s ELSE %s END",
-				field, strings.Join(casesPerField[field], " "), field)
+			queryBuilder.WriteString(fmt.Sprintf("%s = CASE %s ELSE %s END",
+				field, strings.Join(casesPerField[field], " "), field))
 			allValues = append(allValues, valuesPerField[field]...)
 		}
 
-		query += " WHERE "
+		queryBuilder.WriteString(" WHERE ")
 		for i, pkName := range primaryKeyNames {
 			if i > 0 {
-				query += " AND "
+				queryBuilder.WriteString(" AND ")
 			}
-			query += fmt.Sprintf("%s IN (?)", pkName)
+			queryBuilder.WriteString(fmt.Sprintf("%s IN (?)", pkName))
 		}
 
 		for _, pkField := range primaryKeyFields {
@@ -255,8 +257,8 @@ func batchUpdate[T any](
 			allValues = append(allValues, pkValues)
 		}
 
-		if err := db.Exec(query, allValues...).Error; err != nil {
-			return err
+		if execErr := db.Exec(queryBuilder.String(), allValues...).Error; execErr != nil {
+			return execErr
 		}
 
 		return nil
