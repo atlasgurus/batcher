@@ -149,10 +149,10 @@ func batchUpdate[T any](
 			return err
 		}
 
-		var cases []string
-		var values []interface{}
 		updateFieldsMap := make(map[string]bool)
 		var updateFields []string
+		var casesPerField = make(map[string][]string)
+		var valuesPerField = make(map[string][]interface{})
 
 		for _, updateItem := range allUpdateItems {
 			item := updateItem.Item
@@ -160,8 +160,20 @@ func batchUpdate[T any](
 			if itemValue.Kind() == reflect.Ptr {
 				itemValue = itemValue.Elem()
 			}
+			itemType := itemValue.Type()
 
-			for _, fieldName := range updateItem.UpdateFields {
+			fieldsToUpdate := updateItem.UpdateFields
+			if len(fieldsToUpdate) == 0 {
+				// Update all fields except the primary key
+				for i := 0; i < itemType.NumField(); i++ {
+					field := itemType.Field(i)
+					if !strings.Contains(field.Tag.Get("gorm"), "primaryKey") {
+						fieldsToUpdate = append(fieldsToUpdate, field.Name)
+					}
+				}
+			}
+
+			for _, fieldName := range fieldsToUpdate {
 				structFieldName, dbFieldName, err := getFieldNames(fieldName, mapping)
 				if err != nil {
 					return err
@@ -173,23 +185,34 @@ func batchUpdate[T any](
 				}
 
 				caseStmt := fmt.Sprintf("WHEN %s = ? THEN ?", primaryKeyName)
-				cases = append(cases, caseStmt)
-				values = append(values, itemValue.FieldByName(primaryKeyField.Name).Interface())
-				values = append(values, itemValue.FieldByName(structFieldName).Interface())
+				casesPerField[dbFieldName] = append(casesPerField[dbFieldName], caseStmt)
+				valuesPerField[dbFieldName] = append(valuesPerField[dbFieldName],
+					itemValue.FieldByName(primaryKeyField.Name).Interface(),
+					itemValue.FieldByName(structFieldName).Interface())
 			}
 		}
 
+		if len(updateFields) == 0 {
+			return fmt.Errorf("no fields to update")
+		}
+
 		query := fmt.Sprintf("UPDATE %s SET ", tableName)
+		var allValues []interface{}
+
 		for i, field := range updateFields {
 			if i > 0 {
 				query += ", "
 			}
-			query += fmt.Sprintf("%s = CASE %s ELSE %s END", field, strings.Join(cases, " "), field)
+			query += fmt.Sprintf("%s = CASE %s ELSE %s END",
+				field, strings.Join(casesPerField[field], " "), field)
+			allValues = append(allValues, valuesPerField[field]...)
 		}
-		query += fmt.Sprintf(" WHERE %s IN (?)", primaryKeyName)
-		values = append(values, getPrimaryKeyValues(allUpdateItems, primaryKeyField.Name))
 
-		if err := db.Exec(query, values...).Error; err != nil {
+		primaryKeyValues := getPrimaryKeyValues(allUpdateItems, primaryKeyField.Name)
+		query += fmt.Sprintf(" WHERE %s IN (?)", primaryKeyName)
+		allValues = append(allValues, primaryKeyValues)
+
+		if err := db.Exec(query, allValues...).Error; err != nil {
 			return err
 		}
 
