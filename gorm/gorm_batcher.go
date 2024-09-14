@@ -75,6 +75,31 @@ func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 	}, nil
 }
 
+func getPrimaryKeyInfo(t reflect.Type) ([]reflect.StructField, []string, error) {
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	var primaryKeyFields []reflect.StructField
+	var primaryKeyNames []string
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if strings.Contains(field.Tag.Get("gorm"), "primaryKey") {
+			primaryKeyFields = append(primaryKeyFields, field)
+			columnName := field.Tag.Get("gorm")
+			if strings.Contains(columnName, "column:") {
+				columnName = strings.Split(strings.Split(columnName, "column:")[1], ";")[0]
+			} else {
+				columnName = toSnakeCase(field.Name)
+			}
+			primaryKeyNames = append(primaryKeyNames, columnName)
+		}
+	}
+	if len(primaryKeyFields) == 0 {
+		return nil, nil, fmt.Errorf("no primary key found for type %v", t)
+	}
+	return primaryKeyFields, primaryKeyNames, nil
+}
+
 // Insert submits one or more items for batch insertion
 func (b *InsertBatcher[T]) Insert(items ...T) error {
 	return b.batcher.SubmitAndWait(items)
@@ -123,8 +148,8 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) error {
 func batchUpdate[T any](
 	dbProvider DBProvider,
 	tableName string,
-	primaryKeyField reflect.StructField,
-	primaryKeyName string) func([][]UpdateItem[T]) error {
+	primaryKeyFields []reflect.StructField,
+	primaryKeyNames []string) func([][]UpdateItem[T]) error {
 	return func(batches [][]UpdateItem[T]) error {
 		if len(batches) == 0 {
 			return nil
@@ -184,11 +209,20 @@ func batchUpdate[T any](
 					updateFields = append(updateFields, dbFieldName)
 				}
 
-				caseStmt := fmt.Sprintf("WHEN %s = ? THEN ?", primaryKeyName)
+				caseStmt := "WHEN "
+				var caseValues []interface{}
+				for i, pkField := range primaryKeyFields {
+					if i > 0 {
+						caseStmt += " AND "
+					}
+					caseStmt += fmt.Sprintf("%s = ?", primaryKeyNames[i])
+					caseValues = append(caseValues, itemValue.FieldByName(pkField.Name).Interface())
+				}
+				caseStmt += " THEN ?"
+				caseValues = append(caseValues, itemValue.FieldByName(structFieldName).Interface())
+
 				casesPerField[dbFieldName] = append(casesPerField[dbFieldName], caseStmt)
-				valuesPerField[dbFieldName] = append(valuesPerField[dbFieldName],
-					itemValue.FieldByName(primaryKeyField.Name).Interface(),
-					itemValue.FieldByName(structFieldName).Interface())
+				valuesPerField[dbFieldName] = append(valuesPerField[dbFieldName], caseValues...)
 			}
 		}
 
@@ -208,9 +242,18 @@ func batchUpdate[T any](
 			allValues = append(allValues, valuesPerField[field]...)
 		}
 
-		primaryKeyValues := getPrimaryKeyValues(allUpdateItems, primaryKeyField.Name)
-		query += fmt.Sprintf(" WHERE %s IN (?)", primaryKeyName)
-		allValues = append(allValues, primaryKeyValues)
+		query += " WHERE "
+		for i, pkName := range primaryKeyNames {
+			if i > 0 {
+				query += " AND "
+			}
+			query += fmt.Sprintf("%s IN (?)", pkName)
+		}
+
+		for _, pkField := range primaryKeyFields {
+			pkValues := getPrimaryKeyValues(allUpdateItems, pkField.Name)
+			allValues = append(allValues, pkValues)
+		}
 
 		if err := db.Exec(query, allValues...).Error; err != nil {
 			return err
@@ -255,24 +298,6 @@ func getFieldNames(fieldName string, mapping fieldMapping) (string, string, erro
 	return "", "", fmt.Errorf("field %s not found", fieldName)
 }
 
-func getPrimaryKeyInfo(t reflect.Type) (reflect.StructField, string, error) {
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if strings.Contains(field.Tag.Get("gorm"), "primaryKey") {
-			columnName := field.Tag.Get("gorm")
-			if strings.Contains(columnName, "column:") {
-				columnName = strings.Split(strings.Split(columnName, "column:")[1], ";")[0]
-				return field, columnName, nil
-			}
-			return field, field.Name, nil
-		}
-	}
-	return reflect.StructField{}, "", fmt.Errorf("primary key not found for item")
-}
-
 func getDBFieldName(field reflect.StructField) string {
 	if dbName := field.Tag.Get("gorm"); dbName != "" {
 		if strings.Contains(dbName, "column") {
@@ -297,8 +322,14 @@ func getPrimaryKeyValues[T any](items []UpdateItem[T], primaryKeyFieldName strin
 func toSnakeCase(s string) string {
 	var result strings.Builder
 	for i, r := range s {
-		if i > 0 && unicode.IsUpper(r) {
-			result.WriteRune('_')
+		if i > 0 {
+			prevIsLower := unicode.IsLower(rune(s[i-1]))
+			currIsUpper := unicode.IsUpper(r)
+			nextIsLower := i+1 < len(s) && unicode.IsLower(rune(s[i+1]))
+
+			if (prevIsLower && currIsUpper) || (currIsUpper && nextIsLower) {
+				result.WriteRune('_')
+			}
 		}
 		result.WriteRune(unicode.ToLower(r))
 	}
