@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+type BenchTestModel struct {
+	ID       uint   `gorm:"primaryKey"`
+	Name     string `gorm:"type:varchar(100)"`
+	MyValue1 int    `gorm:"type:int"`
+	MyValue2 int    `gorm:"type:int"`
+}
+
 func BenchmarkGORMBatcher(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -19,14 +26,20 @@ func BenchmarkGORMBatcher(b *testing.B) {
 	maxWaitTime := 1 * time.Millisecond
 
 	// Create batchers
-	insertBatcher := NewInsertBatcher[*TestModel](getDBProvider(), maxBatchSize, maxWaitTime, ctx)
-	updateBatcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), maxBatchSize, maxWaitTime, ctx)
+	insertBatcher := NewInsertBatcher[*BenchTestModel](getDBProvider(), maxBatchSize, maxWaitTime, ctx)
+	updateBatcher, err := NewUpdateBatcher[*BenchTestModel](getDBProvider(), maxBatchSize, maxWaitTime, ctx)
 	if err != nil {
 		b.Fatalf("Failed to create update batcher: %v", err)
 	}
 
+	// Migrate the schema
+	err = db.AutoMigrate(&BenchTestModel{}, &CompositeKeyModel{})
+	if err != nil {
+		panic(fmt.Sprintf("failed to migrate database: %v", err))
+	}
+
 	// Clean up the table before the benchmark
-	db.Exec("DELETE FROM test_models")
+	db.Exec("DELETE FROM bench_test_models")
 
 	// Prepare for benchmark
 	var wg sync.WaitGroup
@@ -42,7 +55,7 @@ func BenchmarkGORMBatcher(b *testing.B) {
 				if j%2 == 0 { // Even operations are inserts
 					// Insert
 					id := routineID*operationsPerRoutine + j/2 + 1
-					model := &TestModel{ID: uint(id), Name: fmt.Sprintf("Test %d-%d", routineID, j), MyValue: j}
+					model := &BenchTestModel{ID: uint(id), Name: fmt.Sprintf("Test %d-%d", routineID, j), MyValue1: j}
 					err := insertBatcher.Insert(model)
 					if err != nil {
 						b.Logf("Insert error: %v", err)
@@ -50,10 +63,15 @@ func BenchmarkGORMBatcher(b *testing.B) {
 				} else { // Odd operations are updates
 					// Update
 					id := routineID*operationsPerRoutine + j/2 + 1
-					model := &TestModel{ID: uint(id), MyValue: j * 10}
-					err := updateBatcher.Update([]*TestModel{model}, []string{"my_value"})
-					if err != nil {
-						b.Logf("Update error: %v", err)
+					model := &BenchTestModel{ID: uint(id), MyValue1: j * 10, MyValue2: j * 20}
+					var updateErr error
+					if routineID%2 == 0 {
+						updateErr = updateBatcher.Update([]*BenchTestModel{model}, []string{"my_value1"})
+					} else {
+						updateErr = updateBatcher.Update([]*BenchTestModel{model}, []string{"my_value1", "my_value2"})
+					}
+					if updateErr != nil {
+						b.Logf("Update error: %v", updateErr)
 					}
 				}
 			}
@@ -67,11 +85,14 @@ func BenchmarkGORMBatcher(b *testing.B) {
 
 	// Verify data integrity
 	var count int64
-	db.Model(&TestModel{}).Count(&count)
+	db.Model(&BenchTestModel{}).Count(&count)
 	expectedCount := int64(numRoutines * operationsPerRoutine / 2) // Half of operations are inserts
 
-	var sumValue int64
-	db.Model(&TestModel{}).Select("SUM(my_value)").Row().Scan(&sumValue)
+	var sumValue1 int64
+	db.Model(&BenchTestModel{}).Select("SUM(my_value1)").Row().Scan(&sumValue1)
+
+	var sumValue2 int64
+	db.Model(&BenchTestModel{}).Select("SUM(my_value1)").Row().Scan(&sumValue2)
 
 	// Calculate expected sum
 	expectedSum := int64(0)
@@ -92,13 +113,17 @@ func BenchmarkGORMBatcher(b *testing.B) {
 	b.Logf("Operations per second: %.2f", float64(numRoutines*operationsPerRoutine)/duration.Seconds())
 	b.Logf("Average time per operation: %v", duration/time.Duration(numRoutines*operationsPerRoutine))
 	b.Logf("Total records in database: %d (Expected: %d)", count, expectedCount)
-	b.Logf("Sum of all values in database: %d (Expected: %d)", sumValue, expectedSum)
+	b.Logf("Sum of all MyValue1 in database: %d (Expected: %d)", sumValue1, expectedSum)
+	b.Logf("Sum of all MyValue2 in database: %d (Expected: %d)", sumValue2, expectedSum)
 
 	// Assertions
 	if count != expectedCount {
 		b.Errorf("Record count mismatch. Got: %d, Expected: %d", count, expectedCount)
 	}
-	if sumValue != expectedSum {
-		b.Errorf("Sum of values mismatch. Got: %d, Expected: %d", sumValue, expectedSum)
+	if sumValue1 != expectedSum {
+		b.Errorf("Sum of values mismatch. Got: %d, Expected: %d", sumValue1, expectedSum)
+	}
+	if sumValue2 != expectedSum {
+		b.Errorf("Sum of values mismatch. Got: %d, Expected: %d", sumValue2, expectedSum)
 	}
 }
