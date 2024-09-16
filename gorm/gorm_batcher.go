@@ -75,6 +75,11 @@ func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 	}, nil
 }
 
+func isPrimaryKey(field reflect.StructField) bool {
+	gormTag := field.Tag.Get("gorm")
+	return strings.Contains(gormTag, "primaryKey") || strings.Contains(gormTag, "primary_key")
+}
+
 func getPrimaryKeyInfo(t reflect.Type) ([]reflect.StructField, []string, error) {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
@@ -83,7 +88,7 @@ func getPrimaryKeyInfo(t reflect.Type) ([]reflect.StructField, []string, error) 
 	var primaryKeyNames []string
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		if strings.Contains(field.Tag.Get("gorm"), "primaryKey") {
+		if isPrimaryKey(field) {
 			primaryKeyFields = append(primaryKeyFields, field)
 			columnName := field.Tag.Get("gorm")
 			if strings.Contains(columnName, "column:") {
@@ -192,7 +197,7 @@ func batchUpdate[T any](
 				// Update all fields except the primary key
 				for i := 0; i < itemType.NumField(); i++ {
 					field := itemType.Field(i)
-					if !strings.Contains(field.Tag.Get("gorm"), "primaryKey") {
+					if !isPrimaryKey(field) {
 						fieldsToUpdate = append(fieldsToUpdate, field.Name)
 					}
 				}

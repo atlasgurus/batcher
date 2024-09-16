@@ -9,7 +9,7 @@ import (
 )
 
 type BenchTestModel struct {
-	ID       uint   `gorm:"primaryKey"`
+	ID       uint   `gorm:"primary_key"`
 	Name     string `gorm:"type:varchar(100)"`
 	MyValue1 int    `gorm:"type:int"`
 	MyValue2 int    `gorm:"type:int"`
@@ -22,7 +22,7 @@ func BenchmarkGORMBatcher(b *testing.B) {
 	// Configuration
 	numRoutines := 100
 	operationsPerRoutine := 100
-	maxBatchSize := 60
+	maxBatchSize := 30
 	maxWaitTime := 1 * time.Millisecond
 
 	// Create batchers
