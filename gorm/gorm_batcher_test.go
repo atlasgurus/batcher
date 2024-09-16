@@ -373,3 +373,68 @@ func TestUpdateBatcher_CompositeKey(t *testing.T) {
 		assert.Equal(t, initialModels[i].ID2, model.ID2)
 	}
 }
+
+func TestUpdateBatcher_UpdatedAt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type ModelWithUpdatedAt struct {
+		ID        uint `gorm:"primaryKey"`
+		Name      string
+		MyValue   int
+		UpdatedAt time.Time
+	}
+
+	// Migrate the schema for the new model
+	err := db.AutoMigrate(&ModelWithUpdatedAt{})
+	assert.NoError(t, err)
+
+	batcher, err := NewUpdateBatcher[*ModelWithUpdatedAt](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
+
+	db.Exec("DELETE FROM model_with_updated_ats")
+
+	// Insert initial data
+	initialTime := time.Now().Add(-1 * time.Hour) // Set initial time to 1 hour ago
+	initialModels := []ModelWithUpdatedAt{
+		{Name: "Test 1", MyValue: 10, UpdatedAt: initialTime},
+		{Name: "Test 2", MyValue: 20, UpdatedAt: initialTime},
+		{Name: "Test 3", MyValue: 30, UpdatedAt: initialTime},
+	}
+	db.Create(&initialModels)
+
+	// Sleep to ensure there's a noticeable time difference
+	time.Sleep(100 * time.Millisecond)
+
+	// Update models
+	updatedModels := make([]*ModelWithUpdatedAt, len(initialModels))
+	for i := range initialModels {
+		updatedModels[i] = &ModelWithUpdatedAt{
+			ID:      initialModels[i].ID,
+			Name:    fmt.Sprintf("Updated %d", i+1),
+			MyValue: initialModels[i].MyValue + 5,
+			// Note: We're not setting UpdatedAt here
+		}
+	}
+
+	// Perform update
+	err = batcher.Update(updatedModels, []string{"Name", "MyValue"})
+	assert.NoError(t, err)
+
+	// Retrieve updated models
+	var finalModels []ModelWithUpdatedAt
+	db.Order("id asc").Find(&finalModels)
+	assert.Len(t, finalModels, 3)
+
+	for i, model := range finalModels {
+		assert.Equal(t, fmt.Sprintf("Updated %d", i+1), model.Name)
+		assert.Equal(t, initialModels[i].MyValue+5, model.MyValue)
+
+		// Check that UpdatedAt has been changed
+		assert.True(t, model.UpdatedAt.After(initialTime), "UpdatedAt should be after the initial time")
+		assert.True(t, model.UpdatedAt.After(initialModels[i].UpdatedAt), "UpdatedAt should be updated")
+
+		// Check that UpdatedAt is recent
+		assert.True(t, time.Since(model.UpdatedAt) < 5*time.Second, "UpdatedAt should be very recent")
+	}
+}

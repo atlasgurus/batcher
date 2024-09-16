@@ -203,6 +203,12 @@ func batchUpdate[T any](
 				}
 			}
 
+			// Always include updated_at field if it exists
+			_, updatedAtExists := itemType.FieldByName("UpdatedAt")
+			if updatedAtExists && !contains(fieldsToUpdate, "UpdatedAt") {
+				fieldsToUpdate = append(fieldsToUpdate, "UpdatedAt")
+			}
+
 			for _, fieldName := range fieldsToUpdate {
 				structFieldName, dbFieldName, err := getFieldNames(fieldName, mapping)
 				if err != nil {
@@ -225,7 +231,14 @@ func batchUpdate[T any](
 					caseValues = append(caseValues, itemValue.FieldByName(pkField.Name).Interface())
 				}
 				caseBuilder.WriteString(" THEN ?")
-				caseValues = append(caseValues, itemValue.FieldByName(structFieldName).Interface())
+
+				var fieldValue interface{}
+				if fieldName == "UpdatedAt" {
+					fieldValue = time.Now() // Use current time for updated_at
+				} else {
+					fieldValue = itemValue.FieldByName(structFieldName).Interface()
+				}
+				caseValues = append(caseValues, fieldValue)
 
 				casesPerField[dbFieldName] = append(casesPerField[dbFieldName], caseBuilder.String())
 				valuesPerField[dbFieldName] = append(valuesPerField[dbFieldName], caseValues...)
@@ -268,6 +281,16 @@ func batchUpdate[T any](
 
 		return nil
 	}
+}
+
+// Helper function to check if a slice contains a string
+func contains(slice []string, str string) bool {
+	for _, v := range slice {
+		if v == str {
+			return true
+		}
+	}
+	return false
 }
 
 type fieldMapping struct {
