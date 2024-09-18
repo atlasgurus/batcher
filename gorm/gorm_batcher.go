@@ -10,6 +10,7 @@ import (
 
 	"github.com/atlasgurus/batcher/batcher"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // DBProvider is a function type that returns the current database connection and an error
@@ -140,10 +141,12 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) error {
 			return nil // No records to insert
 		}
 
-		// Perform a single bulk insert for all records
-		err = db.CreateInBatches(allRecords, len(allRecords)).Error
+		// Perform a single bulk upsert for all records, replacing all fields on duplicate
+		err = db.Clauses(clause.OnConflict{
+			UpdateAll: true,
+		}).CreateInBatches(allRecords, len(allRecords)).Error
 		if err != nil {
-			return fmt.Errorf("failed to insert records: %w", err)
+			return fmt.Errorf("failed to upsert records: %w", err)
 		}
 
 		return nil
