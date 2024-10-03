@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+// BatchProcessorInterface defines the common interface for batch processors
+type BatchProcessorInterface[T any] interface {
+	SubmitAndWait(item T) error
+}
+
 // DetailedBatchProcessor is a generic batch processor that supports individual error responses
 type DetailedBatchProcessor[MT any, RT any] struct {
 	input        chan detailedBatchItem[MT, RT]

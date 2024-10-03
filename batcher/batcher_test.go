@@ -251,14 +251,14 @@ func TestDetailedBatchProcessor(t *testing.T) {
 
 	t.Run("IndividualErrors", func(t *testing.T) {
 		ctx := context.Background()
-		processor := NewDetailedBatchProcessor(
+		var processor BatchProcessorInterface[int] = NewDetailedBatchProcessor(
 			5,
 			100*time.Millisecond,
 			ctx,
 			func(items []int) []int {
 				return items
 			},
-			func(item int, result []int) error {
+			func(item int, _ []int) error {
 				if item%2 == 0 {
 					return fmt.Errorf("even number: %d", item)
 				}
