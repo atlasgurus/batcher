@@ -19,13 +19,13 @@ type DBProvider func() (*gorm.DB, error)
 // InsertBatcher is a GORM batcher for batch inserts
 type InsertBatcher[T any] struct {
 	dbProvider DBProvider
-	batcher    *batcher.BatchProcessor[[]T]
+	batcher    batcher.BatchProcessorInterface[[]T]
 }
 
 // UpdateBatcher is a GORM batcher for batch updates
 type UpdateBatcher[T any] struct {
 	dbProvider DBProvider
-	batcher    *batcher.BatchProcessor[[]UpdateItem[T]]
+	batcher    batcher.BatchProcessorInterface[[]UpdateItem[T]]
 	tableName  string
 }
 
@@ -120,15 +120,15 @@ func (b *UpdateBatcher[T]) Update(items []T, updateFields []string) error {
 	return b.batcher.SubmitAndWait(updateItems)
 }
 
-func batchInsert[T any](dbProvider DBProvider) func([][]T) error {
-	return func(batches [][]T) error {
+func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
+	return func(batches [][]T) []error {
 		if len(batches) == 0 {
 			return nil
 		}
 
 		db, err := dbProvider()
 		if err != nil {
-			return fmt.Errorf("failed to get database connection: %w", err)
+			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
 		}
 
 		// Flatten all batches into a single slice
@@ -138,7 +138,7 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) error {
 		}
 
 		if len(allRecords) == 0 {
-			return nil // No records to insert
+			return batcher.RepeatErr(len(batches), nil)
 		}
 
 		// Perform a single bulk upsert for all records, replacing all fields on duplicate
@@ -146,10 +146,10 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) error {
 			UpdateAll: true,
 		}).CreateInBatches(allRecords, len(allRecords)).Error
 		if err != nil {
-			return fmt.Errorf("failed to upsert records: %w", err)
+			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to upsert records: %w", err))
 		}
 
-		return nil
+		return batcher.RepeatErr(len(batches), nil)
 	}
 }
 
@@ -157,15 +157,15 @@ func batchUpdate[T any](
 	dbProvider DBProvider,
 	tableName string,
 	primaryKeyFields []reflect.StructField,
-	primaryKeyNames []string) func([][]UpdateItem[T]) error {
-	return func(batches [][]UpdateItem[T]) error {
+	primaryKeyNames []string) func([][]UpdateItem[T]) []error {
+	return func(batches [][]UpdateItem[T]) []error {
 		if len(batches) == 0 {
 			return nil
 		}
 
 		db, err := dbProvider()
 		if err != nil {
-			return fmt.Errorf("failed to get database connection: %w", err)
+			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
 		}
 
 		var allUpdateItems []UpdateItem[T]
@@ -174,12 +174,12 @@ func batchUpdate[T any](
 		}
 
 		if len(allUpdateItems) == 0 {
-			return nil
+			return batcher.RepeatErr(len(batches), nil)
 		}
 
 		mapping, err := createFieldMapping(allUpdateItems[0].Item)
 		if err != nil {
-			return err
+			return batcher.RepeatErr(len(batches), err)
 		}
 
 		updateFieldsMap := make(map[string]bool)
@@ -213,9 +213,9 @@ func batchUpdate[T any](
 			}
 
 			for _, fieldName := range fieldsToUpdate {
-				structFieldName, dbFieldName, err := getFieldNames(fieldName, mapping)
-				if err != nil {
-					return err
+				structFieldName, dbFieldName, getFieldErr := getFieldNames(fieldName, mapping)
+				if getFieldErr != nil {
+					return batcher.RepeatErr(len(batches), getFieldErr)
 				}
 
 				if !updateFieldsMap[dbFieldName] {
@@ -249,7 +249,7 @@ func batchUpdate[T any](
 		}
 
 		if len(updateFields) == 0 {
-			return fmt.Errorf("no fields to update")
+			return batcher.RepeatErr(len(batches), fmt.Errorf("no fields to update"))
 		}
 
 		var queryBuilder strings.Builder
@@ -279,10 +279,10 @@ func batchUpdate[T any](
 		}
 
 		if execErr := db.Exec(queryBuilder.String(), allValues...).Error; execErr != nil {
-			return execErr
+			return batcher.RepeatErr(len(batches), execErr)
 		}
 
-		return nil
+		return batcher.RepeatErr(len(batches), nil)
 	}
 }
 
