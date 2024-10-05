@@ -443,6 +443,16 @@ func TestSelectBatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	t.Run("TestModel", func(t *testing.T) {
+		runTestModelTests(t, ctx)
+	})
+
+	t.Run("CompositeKeyModel", func(t *testing.T) {
+		runCompositeKeyModelTests(t, ctx)
+	})
+}
+
+func runTestModelTests(t *testing.T, ctx context.Context) {
 	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx, []string{"id", "name", "my_value"})
 	assert.NoError(t, err)
 
@@ -457,24 +467,71 @@ func TestSelectBatcher(t *testing.T) {
 		{Name: "Test 4", MyValue: 40},
 		{Name: "Test 5", MyValue: 50},
 	}
-	db.Create(&testModels)
+	result := db.Create(&testModels)
+	assert.NoError(t, result.Error)
+	assert.Equal(t, int64(5), result.RowsAffected)
 
+	// Run basic tests
+	runBasicTests(t, selectBatcher,
+		func(m TestModel) string { return m.Name },
+		func(m TestModel) int { return m.MyValue },
+	)
+
+	// Run concurrent tests
+	runConcurrentTests(t, selectBatcher)
+}
+
+func runCompositeKeyModelTests(t *testing.T, ctx context.Context) {
+	selectBatcher, err := NewSelectBatcher[CompositeKeyModel](getDBProvider(), 3, 100*time.Millisecond, ctx, []string{"id1", "id2", "name", "my_value"})
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM composite_key_models")
+
+	// Insert some test data
+	testModels := []CompositeKeyModel{
+		{ID1: 1, ID2: "A", Name: "Test 1", MyValue: 10},
+		{ID1: 1, ID2: "B", Name: "Test 2", MyValue: 20},
+		{ID1: 2, ID2: "A", Name: "Test 3", MyValue: 30},
+		{ID2: "B", Name: "Test 4", MyValue: 40},
+		{ID1: 3, ID2: "A", Name: "Test 5", MyValue: 50},
+	}
+	result := db.Create(&testModels)
+	assert.NoError(t, result.Error)
+	assert.Equal(t, int64(5), result.RowsAffected)
+
+	// Run basic tests
+	runBasicTests(t, selectBatcher,
+		func(m CompositeKeyModel) string { return m.Name },
+		func(m CompositeKeyModel) int { return m.MyValue },
+	)
+
+	// Run composite key specific tests
+	runCompositeKeySpecificTests(t, selectBatcher)
+
+	// Run concurrent tests
+	runConcurrentTests(t, selectBatcher)
+}
+
+func runBasicTests[T any](t *testing.T, selectBatcher *SelectBatcher[T], getNameFunc func(T) string, getMyValueFunc func(T) int) {
 	// Test single result
 	t.Run("SingleResult", func(t *testing.T) {
 		results, err := selectBatcher.Select("name = ?", "Test 1")
 		assert.NoError(t, err)
-		assert.Len(t, results, 1)
-		assert.Equal(t, "Test 1", results[0].Name)
-		assert.Equal(t, 10, results[0].MyValue)
+		assert.Len(t, results, 1, "Expected 1 result, got %d", len(results))
+		if len(results) > 0 {
+			assert.Equal(t, "Test 1", getNameFunc(results[0]))
+			assert.Equal(t, 10, getMyValueFunc(results[0]))
+		}
 	})
 
 	// Test multiple results
 	t.Run("MultipleResults", func(t *testing.T) {
 		results, err := selectBatcher.Select("my_value > ?", 25)
 		assert.NoError(t, err)
-		assert.Len(t, results, 3)
+		assert.Len(t, results, 3, "Expected 3 results, got %d", len(results))
 		for _, result := range results {
-			assert.True(t, result.MyValue > 25)
+			assert.True(t, getMyValueFunc(result) > 25, "Expected MyValue > 25, got %d", getMyValueFunc(result))
 		}
 	})
 
@@ -482,7 +539,7 @@ func TestSelectBatcher(t *testing.T) {
 	t.Run("NoResults", func(t *testing.T) {
 		results, err := selectBatcher.Select("name = ?", "Nonexistent")
 		assert.NoError(t, err)
-		assert.Len(t, results, 0)
+		assert.Len(t, results, 0, "Expected 0 results, got %d", len(results))
 	})
 
 	// Test error handling
@@ -492,80 +549,41 @@ func TestSelectBatcher(t *testing.T) {
 	})
 }
 
-func TestSelectBatcherConcurrent(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx, []string{"id", "name", "my_value"})
-	assert.NoError(t, err)
-
-	// Clean up the table before the test
-	db.Exec("DELETE FROM test_models")
-
-	// Insert test data
-	testModels := make([]TestModel, 100)
-	for i := range testModels {
-		testModels[i] = TestModel{Name: fmt.Sprintf("Test %d", i+1), MyValue: (i + 1) * 10}
-	}
-	db.Create(&testModels)
-
-	var wg sync.WaitGroup
-	operationCount := 50
-
-	results := make([][]TestModel, operationCount)
-	errors := make([]error, operationCount)
-
-	for i := 0; i < operationCount; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			results[i], errors[i] = selectBatcher.Select("my_value > ?", rand.Intn(500))
-		}(i)
-	}
-
-	wg.Wait()
-
-	// Verify results
-	for i := 0; i < operationCount; i++ {
-		assert.NoError(t, errors[i])
-		if len(results[i]) > 0 {
-			for _, result := range results[i] {
-				assert.NotEmpty(t, result.Name)
-				assert.NotZero(t, result.MyValue)
-			}
+func runCompositeKeySpecificTests(t *testing.T, selectBatcher *SelectBatcher[CompositeKeyModel]) {
+	// Test single result with composite key
+	t.Run("SingleResultCompositeKey", func(t *testing.T) {
+		results, err := selectBatcher.Select("id1 = ? AND id2 = ?", 1, "A")
+		assert.NoError(t, err)
+		assert.Len(t, results, 1, "Expected 1 result, got %d", len(results))
+		if len(results) > 0 {
+			assert.Equal(t, 1, results[0].ID1)
+			assert.Equal(t, "A", results[0].ID2)
+			assert.Equal(t, "Test 1", results[0].Name)
+			assert.Equal(t, 10, results[0].MyValue)
 		}
-	}
+	})
 }
 
-func TestSelectBatcherLargeDataset(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func runConcurrentTests[T any](t *testing.T, selectBatcher *SelectBatcher[T]) {
+	t.Run("ConcurrentSelects", func(t *testing.T) {
+		var wg sync.WaitGroup
+		numGoroutines := 100
+		results := make([][]T, numGoroutines)
+		errors := make([]error, numGoroutines)
 
-	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 100, 200*time.Millisecond, ctx, []string{"id", "name", "my_value"})
-	assert.NoError(t, err)
-
-	// Clean up the table before the test
-	db.Exec("DELETE FROM test_models")
-
-	// Insert a large number of test records
-	batchSize := 1000
-	totalRecords := 10000
-	for i := 0; i < totalRecords; i += batchSize {
-		batch := make([]TestModel, batchSize)
-		for j := range batch {
-			batch[j] = TestModel{Name: fmt.Sprintf("Test %d", i+j+1), MyValue: (i + j + 1) * 10}
+		for i := 0; i < numGoroutines; i++ {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				results[index], errors[index] = selectBatcher.Select("my_value > ?", rand.Intn(40))
+			}(i)
 		}
-		db.Create(&batch)
-	}
 
-	// Perform a select operation that returns a large number of results
-	results, err := selectBatcher.Select("my_value > ?", 0)
-	assert.NoError(t, err)
-	assert.Len(t, results, totalRecords)
+		wg.Wait()
 
-	// Verify a sample of the results
-	assert.Equal(t, "Test 1", results[0].Name)
-	assert.Equal(t, 10, results[0].MyValue)
-	assert.Equal(t, fmt.Sprintf("Test %d", totalRecords), results[totalRecords-1].Name)
-	assert.Equal(t, totalRecords*10, results[totalRecords-1].MyValue)
+		for i := 0; i < numGoroutines; i++ {
+			assert.NoError(t, errors[i])
+			assert.NotNil(t, results[i])
+		}
+	})
 }

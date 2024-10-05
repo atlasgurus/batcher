@@ -404,8 +404,6 @@ func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 		columns:    columns,
 	}, nil
 }
-
-// Select submits one or more items for batch selection
 func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, error) {
 	var results []T
 	item := SelectItem[T]{
@@ -505,13 +503,67 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 func scanIntoStruct(result interface{}, columns []string, values []interface{}) error {
 	resultValue := reflect.ValueOf(result).Elem()
+	resultType := resultValue.Type()
+
 	for i, column := range columns {
-		field := resultValue.FieldByName(column)
-		if field.IsValid() && field.CanSet() {
-			value := reflect.ValueOf(values[i]).Elem().Interface()
-			if value != nil {
-				field.Set(reflect.ValueOf(value))
+		value := reflect.ValueOf(values[i]).Elem().Interface()
+
+		field := resultValue.FieldByNameFunc(func(name string) bool {
+			field, _ := resultType.FieldByName(name)
+			dbName := field.Tag.Get("gorm")
+			if dbName == column {
+				return true
 			}
+			return strings.EqualFold(name, column) || strings.EqualFold(toSnakeCase(name), column)
+		})
+
+		if field.IsValid() && field.CanSet() {
+
+			switch field.Kind() {
+			case reflect.String:
+				switch v := value.(type) {
+				case []uint8:
+					field.SetString(string(v))
+				case string:
+					field.SetString(v)
+				default:
+					return fmt.Errorf("failed to set string field %s: unexpected type %T", column, value)
+				}
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				switch v := value.(type) {
+				case int64:
+					field.SetUint(uint64(v))
+				case uint64:
+					field.SetUint(v)
+				default:
+					return fmt.Errorf("failed to set uint field %s: unexpected type %T", column, value)
+				}
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				switch v := value.(type) {
+				case int64:
+					field.SetInt(v)
+				case int:
+					field.SetInt(int64(v))
+				default:
+					return fmt.Errorf("failed to set int field %s: unexpected type %T", column, value)
+				}
+			case reflect.Float32, reflect.Float64:
+				v, ok := value.(float64)
+				if !ok {
+					return fmt.Errorf("failed to set float field %s: unexpected type %T", column, value)
+				}
+				field.SetFloat(v)
+			case reflect.Bool:
+				v, ok := value.(bool)
+				if !ok {
+					return fmt.Errorf("failed to set bool field %s: unexpected type %T", column, value)
+				}
+				field.SetBool(v)
+			default:
+				return fmt.Errorf("unsupported field type for %s: %v", column, field.Kind())
+			}
+		} else {
+			return fmt.Errorf("field %s is not valid or cannot be set", column)
 		}
 	}
 	return nil
