@@ -483,21 +483,22 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
-		// Build the query
-		var queryParts []string
+		// Build the query using GORM's query builder
+		var unions []string
 		var args []interface{}
-
 		for i, item := range allItems {
-			selectColumns := append([]string{fmt.Sprintf("%d AS __index", i)}, columns...)
-			queryPart := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
+			selectColumns := append([]string{fmt.Sprintf("? AS __index", i)}, columns...)
+			union := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
 				strings.Join(selectColumns, ", "),
 				tableName,
 				item.Condition)
-			queryParts = append(queryParts, queryPart)
+			unions = append(unions, union)
+			args = append(args, i)
 			args = append(args, item.Args...)
 		}
 
-		query := fmt.Sprintf("(%s) ORDER BY __index", strings.Join(queryParts, ") UNION ALL ("))
+		query := strings.Join(unions, " UNION ALL ")
+		query += " ORDER BY __index"
 
 		// Execute the query
 		rows, err := db.Raw(query, args...).Rows()
