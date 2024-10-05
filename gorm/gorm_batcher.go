@@ -43,12 +43,6 @@ func NewInsertBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 	}
 }
 
-type batchUpdater struct {
-	primaryKeyField reflect.StructField
-	primaryKeyName  string
-	tableName       string
-}
-
 // NewUpdateBatcher creates a new GORM update batcher
 func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) (*UpdateBatcher[T], error) {
 	// Create a temporary DB connection to get the table name
@@ -185,9 +179,9 @@ func batchUpdate[T any](
 			return nil
 		}
 
-		db, err := dbProvider()
-		if err != nil {
-			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
+		db, dbProviderErr := dbProvider()
+		if dbProviderErr != nil {
+			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", dbProviderErr))
 		}
 
 		var allUpdateItems []UpdateItem[T]
@@ -201,7 +195,7 @@ func batchUpdate[T any](
 
 		var lastErr error
 		for attempt := 0; attempt < maxRetries; attempt++ {
-			err = db.Transaction(func(tx *gorm.DB) error {
+			err := db.Transaction(func(tx *gorm.DB) error {
 				mapping, err := createFieldMapping(allUpdateItems[0].Item)
 				if err != nil {
 					return err
@@ -489,18 +483,18 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		for i, item := range allItems {
 			selectColumns := append([]string{fmt.Sprintf("%d AS __index", i)}, columns...)
-			queryPart := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
+			subQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
 				strings.Join(selectColumns, ", "),
 				tableName,
 				item.Condition)
-			queryParts = append(queryParts, queryPart)
+			queryParts = append(queryParts, subQuery)
 			args = append(args, item.Args...)
 		}
 
-		query := fmt.Sprintf("(%s) ORDER BY __index", strings.Join(queryParts, ") UNION ALL ("))
+		fullQuery := fmt.Sprintf("(%s) ORDER BY __index", strings.Join(queryParts, ") UNION ALL ("))
 
 		// Execute the query
-		rows, err := db.Raw(query, args...).Rows()
+		rows, err := db.Raw(fullQuery, args...).Rows()
 		if err != nil {
 			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to execute select query: %w", err))
 		}
