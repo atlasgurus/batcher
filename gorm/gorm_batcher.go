@@ -368,3 +368,151 @@ func toSnakeCase(s string) string {
 	}
 	return result.String()
 }
+
+// SelectBatcher is a GORM batcher for batch selects
+type SelectBatcher[T any] struct {
+	dbProvider DBProvider
+	batcher    batcher.BatchProcessorInterface[[]SelectItem[T]]
+	tableName  string
+	columns    []string
+}
+
+type SelectItem[T any] struct {
+	Condition string
+	Args      []interface{}
+	Results   *[]T
+}
+
+// NewSelectBatcher creates a new GORM select batcher
+func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context, columns []string) (*SelectBatcher[T], error) {
+	db, err := dbProvider()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database connection: %w", err)
+	}
+
+	var model T
+	stmt := &gorm.Statement{DB: db}
+	err = stmt.Parse(&model)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse model for table name: %w", err)
+	}
+
+	return &SelectBatcher[T]{
+		dbProvider: dbProvider,
+		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchSelect[T](dbProvider, stmt.Table, columns)),
+		tableName:  stmt.Table,
+		columns:    columns,
+	}, nil
+}
+
+// Select submits one or more items for batch selection
+func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, error) {
+	var results []T
+	item := SelectItem[T]{
+		Condition: condition,
+		Args:      args,
+		Results:   &results,
+	}
+	err := b.batcher.SubmitAndWait([]SelectItem[T]{item})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string) func([][]SelectItem[T]) []error {
+	return func(batches [][]SelectItem[T]) []error {
+		if len(batches) == 0 {
+			return nil
+		}
+
+		db, err := dbProvider()
+		if err != nil {
+			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
+		}
+
+		var allItems []SelectItem[T]
+		for _, batch := range batches {
+			allItems = append(allItems, batch...)
+		}
+
+		if len(allItems) == 0 {
+			return batcher.RepeatErr(len(batches), nil)
+		}
+
+		// Build the query
+		var queryParts []string
+		var args []interface{}
+
+		for i, item := range allItems {
+			selectColumns := append([]string{fmt.Sprintf("%d AS __index", i)}, columns...)
+			queryPart := fmt.Sprintf("(SELECT %s FROM %s WHERE %s)",
+				strings.Join(selectColumns, ", "),
+				tableName,
+				item.Condition)
+			queryParts = append(queryParts, queryPart)
+			args = append(args, item.Args...)
+		}
+
+		query := strings.Join(queryParts, " UNION ALL ")
+		query += " ORDER BY __index"
+
+		// Execute the query
+		rows, err := db.Raw(query, args...).Rows()
+		if err != nil {
+			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to execute select query: %w", err))
+		}
+		defer rows.Close()
+
+		// Prepare a slice of slices to hold all results
+		results := make([][]T, len(allItems))
+		for i := range results {
+			results[i] = make([]T, 0)
+		}
+
+		// Scan the results
+		for rows.Next() {
+			values := make([]interface{}, len(columns)+1) // +1 for __index
+			for i := range values {
+				values[i] = new(interface{})
+			}
+
+			if err := rows.Scan(values...); err != nil {
+				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan row: %w", err))
+			}
+
+			// Get the index
+			index := int((*values[0].(*interface{})).(int64))
+
+			// Create a new instance of T and scan into it
+			var result T
+			if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
+				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan into struct: %w", err))
+			}
+
+			// Append the result to the corresponding slice
+			results[index] = append(results[index], result)
+		}
+
+		// Assign results back to the original items
+		for i, item := range allItems {
+			*item.Results = results[i]
+		}
+
+		return batcher.RepeatErr(len(batches), nil)
+	}
+}
+
+func scanIntoStruct(result interface{}, columns []string, values []interface{}) error {
+	resultValue := reflect.ValueOf(result).Elem()
+	for i, column := range columns {
+		field := resultValue.FieldByName(column)
+		if field.IsValid() && field.CanSet() {
+			value := reflect.ValueOf(values[i]).Elem().Interface()
+			if value != nil {
+				field.Set(reflect.ValueOf(value))
+			}
+		}
+	}
+	return nil
+}

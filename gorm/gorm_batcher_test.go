@@ -438,3 +438,134 @@ func TestUpdateBatcher_UpdatedAt(t *testing.T) {
 		assert.True(t, time.Since(model.UpdatedAt) < 5*time.Second, "UpdatedAt should be very recent")
 	}
 }
+
+func TestSelectBatcher(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx, []string{"id", "name", "my_value"})
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert some test data
+	testModels := []TestModel{
+		{Name: "Test 1", MyValue: 10},
+		{Name: "Test 2", MyValue: 20},
+		{Name: "Test 3", MyValue: 30},
+		{Name: "Test 4", MyValue: 40},
+		{Name: "Test 5", MyValue: 50},
+	}
+	db.Create(&testModels)
+
+	// Test single result
+	t.Run("SingleResult", func(t *testing.T) {
+		results, err := selectBatcher.Select("name = ?", "Test 1")
+		assert.NoError(t, err)
+		assert.Len(t, results, 1)
+		assert.Equal(t, "Test 1", results[0].Name)
+		assert.Equal(t, 10, results[0].MyValue)
+	})
+
+	// Test multiple results
+	t.Run("MultipleResults", func(t *testing.T) {
+		results, err := selectBatcher.Select("my_value > ?", 25)
+		assert.NoError(t, err)
+		assert.Len(t, results, 3)
+		for _, result := range results {
+			assert.True(t, result.MyValue > 25)
+		}
+	})
+
+	// Test no results
+	t.Run("NoResults", func(t *testing.T) {
+		results, err := selectBatcher.Select("name = ?", "Nonexistent")
+		assert.NoError(t, err)
+		assert.Len(t, results, 0)
+	})
+
+	// Test error handling
+	t.Run("ErrorHandling", func(t *testing.T) {
+		_, err := selectBatcher.Select("invalid_column = ?", "value")
+		assert.Error(t, err)
+	})
+}
+
+func TestSelectBatcherConcurrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx, []string{"id", "name", "my_value"})
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert test data
+	testModels := make([]TestModel, 100)
+	for i := range testModels {
+		testModels[i] = TestModel{Name: fmt.Sprintf("Test %d", i+1), MyValue: (i + 1) * 10}
+	}
+	db.Create(&testModels)
+
+	var wg sync.WaitGroup
+	operationCount := 50
+
+	results := make([][]TestModel, operationCount)
+	errors := make([]error, operationCount)
+
+	for i := 0; i < operationCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errors[i] = selectBatcher.Select("my_value > ?", rand.Intn(500))
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify results
+	for i := 0; i < operationCount; i++ {
+		assert.NoError(t, errors[i])
+		if len(results[i]) > 0 {
+			for _, result := range results[i] {
+				assert.NotEmpty(t, result.Name)
+				assert.NotZero(t, result.MyValue)
+			}
+		}
+	}
+}
+
+func TestSelectBatcherLargeDataset(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 100, 200*time.Millisecond, ctx, []string{"id", "name", "my_value"})
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert a large number of test records
+	batchSize := 1000
+	totalRecords := 10000
+	for i := 0; i < totalRecords; i += batchSize {
+		batch := make([]TestModel, batchSize)
+		for j := range batch {
+			batch[j] = TestModel{Name: fmt.Sprintf("Test %d", i+j+1), MyValue: (i + j + 1) * 10}
+		}
+		db.Create(&batch)
+	}
+
+	// Perform a select operation that returns a large number of results
+	results, err := selectBatcher.Select("my_value > ?", 0)
+	assert.NoError(t, err)
+	assert.Len(t, results, totalRecords)
+
+	// Verify a sample of the results
+	assert.Equal(t, "Test 1", results[0].Name)
+	assert.Equal(t, 10, results[0].MyValue)
+	assert.Equal(t, fmt.Sprintf("Test %d", totalRecords), results[totalRecords-1].Name)
+	assert.Equal(t, totalRecords*10, results[totalRecords-1].MyValue)
+}
