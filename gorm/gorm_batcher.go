@@ -489,7 +489,7 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		for i, item := range allItems {
 			selectColumns := append([]string{fmt.Sprintf("%d AS __index", i)}, columns...)
-			queryPart := fmt.Sprintf("(SELECT %s FROM %s WHERE %s)",
+			queryPart := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
 				strings.Join(selectColumns, ", "),
 				tableName,
 				item.Condition)
@@ -497,8 +497,7 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			args = append(args, item.Args...)
 		}
 
-		query := strings.Join(queryParts, " UNION ALL ")
-		query += " ORDER BY __index"
+		query := fmt.Sprintf("(%s) ORDER BY __index", strings.Join(queryParts, ") UNION ALL ("))
 
 		// Execute the query
 		rows, err := db.Raw(query, args...).Rows()
