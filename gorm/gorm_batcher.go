@@ -476,8 +476,15 @@ func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, e
 	}
 	return results, nil
 }
+
 func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string) func([][]SelectItem[T]) []error {
-	return func(batches [][]SelectItem[T]) []error {
+	return func(batches [][]SelectItem[T]) (errs []error) {
+		defer func() {
+			if r := recover(); r != nil {
+				errs = batcher.RepeatErr(len(batches), fmt.Errorf("panic in batchSelect: %v", r))
+			}
+		}()
+
 		if len(batches) == 0 {
 			return nil
 		}
@@ -540,7 +547,32 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			}
 
 			// Get the index
-			index := int((*values[0].(*interface{})).(int64))
+			indexValue := reflect.ValueOf(values[0]).Elem().Interface()
+			var index int
+			switch v := indexValue.(type) {
+			case int:
+				index = v
+			case int8:
+				index = int(v)
+			case int16:
+				index = int(v)
+			case int32:
+				index = int(v)
+			case int64:
+				index = int(v)
+			case uint:
+				index = int(v)
+			case uint8:
+				index = int(v)
+			case uint16:
+				index = int(v)
+			case uint32:
+				index = int(v)
+			case uint64:
+				index = int(v)
+			default:
+				return batcher.RepeatErr(len(batches), fmt.Errorf("unexpected index type: %T", indexValue))
+			}
 
 			// Create a new instance of T and scan into it
 			var result T
