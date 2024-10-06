@@ -492,7 +492,7 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 		}()
 
 		if len(batches) == 0 {
-			return nil
+			return batcher.RepeatErr(len(batches), nil)
 		}
 
 		db, err := dbProvider()
@@ -513,24 +513,37 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 		var queryBuilder strings.Builder
 		var args []interface{}
 
+		dialectName := db.Dialector.Name()
+		var indexCastExpr string
+		switch dialectName {
+		case "mysql":
+			indexCastExpr = "CAST(? AS CHAR)"
+		case "postgres":
+			indexCastExpr = "CAST(? AS TEXT)"
+		case "sqlite":
+			indexCastExpr = "CAST(? AS TEXT)"
+		default:
+			indexCastExpr = "CAST(? AS TEXT)"
+		}
+
 		for i, item := range allItems {
 			if i > 0 {
 				queryBuilder.WriteString(" UNION ALL ")
 			}
 			quotedColumns := make([]string, len(columns))
 			for j, col := range columns {
-				quotedColumns[j] = fmt.Sprintf("`%s`", col)
+				quotedColumns[j] = quoteIdentifier(col, dialectName)
 			}
-			selectColumns := append([]string{fmt.Sprintf("CAST(? AS CHAR) AS `__index`")}, quotedColumns...)
-			queryBuilder.WriteString(fmt.Sprintf("SELECT %s FROM `%s` WHERE %s",
+			selectColumns := append([]string{fmt.Sprintf("%s AS %s", indexCastExpr, quoteIdentifier("__index", dialectName))}, quotedColumns...)
+			queryBuilder.WriteString(fmt.Sprintf("SELECT %s FROM %s WHERE %s",
 				strings.Join(selectColumns, ", "),
-				tableName,
+				quoteIdentifier(tableName, dialectName),
 				item.Condition))
 			args = append(args, i) // Add index as an argument
 			args = append(args, item.Args...)
 		}
 
-		queryBuilder.WriteString(" ORDER BY `__index`")
+		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
 		// Execute the query
 		rows, err := db.Raw(queryBuilder.String(), args...).Rows()
@@ -562,21 +575,9 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			switch v := indexValue.(type) {
 			case int:
 				index = v
-			case int8:
-				index = int(v)
-			case int16:
-				index = int(v)
-			case int32:
-				index = int(v)
 			case int64:
 				index = int(v)
 			case uint:
-				index = int(v)
-			case uint8:
-				index = int(v)
-			case uint16:
-				index = int(v)
-			case uint32:
 				index = int(v)
 			case uint64:
 				index = int(v)
@@ -612,6 +613,19 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 		}
 
 		return batcher.RepeatErr(len(batches), nil)
+	}
+}
+
+func quoteIdentifier(identifier string, dialect string) string {
+	switch dialect {
+	case "mysql":
+		return "`" + strings.Replace(identifier, "`", "``", -1) + "`"
+	case "postgres":
+		return `"` + strings.Replace(identifier, `"`, `""`, -1) + `"`
+	case "sqlite":
+		return `"` + strings.Replace(identifier, `"`, `""`, -1) + `"`
+	default:
+		return identifier
 	}
 }
 
