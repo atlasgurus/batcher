@@ -323,7 +323,8 @@ func batchUpdate[T any](
 }
 
 func isDeadlockError(err error) bool {
-	return strings.Contains(err.Error(), "Deadlock found when trying to get lock")
+	return strings.Contains(err.Error(), "Deadlock found when trying to get lock") ||
+		strings.Contains(err.Error(), "database table is locked")
 }
 
 // Helper function to check if a slice contains a string
@@ -545,6 +546,10 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
+		// Log the query and args
+		fmt.Printf("Executing query: %s\n", queryBuilder.String())
+		fmt.Printf("Query args: %v\n", args)
+
 		// Execute the query
 		rows, err := db.Raw(queryBuilder.String(), args...).Rows()
 		if err != nil {
@@ -594,7 +599,7 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 				}
 				index = parsedIndex
 			default:
-				return batcher.RepeatErr(len(batches), fmt.Errorf("unexpected index type: %T", indexValue))
+				return batcher.RepeatErr(len(batches), fmt.Errorf("unexpected index type: %T with value: %v", indexValue, indexValue))
 			}
 
 			// Create a new instance of T and scan into it
