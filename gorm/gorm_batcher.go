@@ -645,7 +645,23 @@ func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, e
 }
 
 func scanIntoStruct(result interface{}, columns []string, values []interface{}) error {
-	resultValue := reflect.ValueOf(result).Elem()
+	resultValue := reflect.ValueOf(result)
+	if resultValue.Kind() != reflect.Ptr {
+		return fmt.Errorf("result must be a pointer")
+	}
+	resultValue = resultValue.Elem()
+
+	if resultValue.Kind() == reflect.Ptr {
+		if resultValue.IsNil() {
+			resultValue.Set(reflect.New(resultValue.Type().Elem()))
+		}
+		resultValue = resultValue.Elem()
+	}
+
+	if resultValue.Kind() != reflect.Struct {
+		return fmt.Errorf("result must be a pointer to a struct")
+	}
+
 	resultType := resultValue.Type()
 
 	for i, column := range columns {
@@ -663,12 +679,7 @@ func scanIntoStruct(result interface{}, columns []string, values []interface{}) 
 		})
 
 		if !field.IsValid() {
-			// Try to find the field by converting the column name to CamelCase
-			camelCaseColumn := toCamelCase(column)
-			field = resultValue.FieldByName(camelCaseColumn)
-			if !field.IsValid() {
-				return fmt.Errorf("no field found for column %s", column)
-			}
+			return fmt.Errorf("no field found for column %s", column)
 		}
 
 		if !field.CanSet() {
@@ -720,39 +731,4 @@ func scanIntoStruct(result interface{}, columns []string, values []interface{}) 
 		}
 	}
 	return nil
-}
-
-func toCamelCase(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return s
-	}
-
-	n := strings.Builder{}
-	n.Grow(len(s))
-	capNext := true
-	for i, v := range []byte(s) {
-		vIsCap := v >= 'A' && v <= 'Z'
-		vIsLow := v >= 'a' && v <= 'z'
-		if capNext {
-			if vIsLow {
-				v -= 32
-			}
-		} else if i == 0 {
-			if vIsCap {
-				v += 32
-			}
-		}
-
-		if vIsCap || vIsLow {
-			n.WriteByte(v)
-			capNext = false
-		} else if vIsNum := v >= '0' && v <= '9'; vIsNum {
-			n.WriteByte(v)
-			capNext = true
-		} else {
-			capNext = v == '_' || v == ' ' || v == '-' || v == '.'
-		}
-	}
-	return n.String()
 }
