@@ -436,13 +436,33 @@ func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 		return nil, fmt.Errorf("failed to parse model for table name: %w", err)
 	}
 
+	// Handle column quoting
+	quotedColumns := make([]string, len(columns))
+	for i, col := range columns {
+		quotedColumns[i] = quoteIdentifier(col, db.Dialector.Name())
+	}
+
 	return &SelectBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchSelect[T](dbProvider, stmt.Table, columns)),
+		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchSelect[T](dbProvider, stmt.Table, quotedColumns)),
 		tableName:  stmt.Table,
-		columns:    columns,
+		columns:    quotedColumns,
 	}, nil
 }
+
+func quoteIdentifier(identifier string, dialect string) string {
+	switch dialect {
+	case "mysql":
+		return "`" + strings.Replace(identifier, "`", "``", -1) + "`"
+	case "postgres":
+		return `"` + strings.Replace(identifier, `"`, `""`, -1) + `"`
+	case "sqlite":
+		return `"` + strings.Replace(identifier, `"`, `""`, -1) + `"`
+	default:
+		return identifier // For unsupported dialects, return the identifier as-is
+	}
+}
+
 func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, error) {
 	var results []T
 	item := SelectItem[T]{
@@ -456,7 +476,6 @@ func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, e
 	}
 	return results, nil
 }
-
 func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string) func([][]SelectItem[T]) []error {
 	return func(batches [][]SelectItem[T]) []error {
 		if len(batches) == 0 {
@@ -478,23 +497,26 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 		}
 
 		// Build the query
-		var queryParts []string
+		var queryBuilder strings.Builder
 		var args []interface{}
 
 		for i, item := range allItems {
-			selectColumns := append([]string{fmt.Sprintf("%d AS __index", i)}, columns...)
-			subQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s",
+			if i > 0 {
+				queryBuilder.WriteString(" UNION ALL ")
+			}
+			selectColumns := append([]string{fmt.Sprintf("? AS __index")}, columns...)
+			queryBuilder.WriteString(fmt.Sprintf("SELECT %s FROM %s WHERE %s",
 				strings.Join(selectColumns, ", "),
 				tableName,
-				item.Condition)
-			queryParts = append(queryParts, subQuery)
+				item.Condition))
+			args = append(args, i) // Add index as an argument
 			args = append(args, item.Args...)
 		}
 
-		fullQuery := fmt.Sprintf("(%s) ORDER BY __index", strings.Join(queryParts, ") UNION ALL ("))
+		queryBuilder.WriteString(" ORDER BY __index")
 
 		// Execute the query
-		rows, err := db.Raw(fullQuery, args...).Rows()
+		rows, err := db.Raw(queryBuilder.String(), args...).Rows()
 		if err != nil {
 			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to execute select query: %w", err))
 		}
@@ -522,7 +544,11 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 			// Create a new instance of T and scan into it
 			var result T
-			if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
+			unquotedColumns := make([]string, len(columns))
+			for i, col := range columns {
+				unquotedColumns[i] = strings.Trim(col, "`\"") // Remove backticks and double quotes
+			}
+			if err := scanIntoStruct(&result, unquotedColumns, values[1:]); err != nil {
 				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan into struct: %w", err))
 			}
 
@@ -552,57 +578,102 @@ func scanIntoStruct(result interface{}, columns []string, values []interface{}) 
 			if dbName == column {
 				return true
 			}
-			return strings.EqualFold(name, column) || strings.EqualFold(toSnakeCase(name), column)
+			return strings.EqualFold(name, column) ||
+				strings.EqualFold(toSnakeCase(name), column) ||
+				strings.EqualFold(name, strings.ReplaceAll(column, "_", ""))
 		})
 
-		if field.IsValid() && field.CanSet() {
-
-			switch field.Kind() {
-			case reflect.String:
-				switch v := value.(type) {
-				case []uint8:
-					field.SetString(string(v))
-				case string:
-					field.SetString(v)
-				default:
-					return fmt.Errorf("failed to set string field %s: unexpected type %T", column, value)
-				}
-			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-				switch v := value.(type) {
-				case int64:
-					field.SetUint(uint64(v))
-				case uint64:
-					field.SetUint(v)
-				default:
-					return fmt.Errorf("failed to set uint field %s: unexpected type %T", column, value)
-				}
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-				switch v := value.(type) {
-				case int64:
-					field.SetInt(v)
-				case int:
-					field.SetInt(int64(v))
-				default:
-					return fmt.Errorf("failed to set int field %s: unexpected type %T", column, value)
-				}
-			case reflect.Float32, reflect.Float64:
-				v, ok := value.(float64)
-				if !ok {
-					return fmt.Errorf("failed to set float field %s: unexpected type %T", column, value)
-				}
-				field.SetFloat(v)
-			case reflect.Bool:
-				v, ok := value.(bool)
-				if !ok {
-					return fmt.Errorf("failed to set bool field %s: unexpected type %T", column, value)
-				}
-				field.SetBool(v)
-			default:
-				return fmt.Errorf("unsupported field type for %s: %v", column, field.Kind())
+		if !field.IsValid() {
+			// Try to find the field by converting the column name to CamelCase
+			camelCaseColumn := toCamelCase(column)
+			field = resultValue.FieldByName(camelCaseColumn)
+			if !field.IsValid() {
+				return fmt.Errorf("no field found for column %s", column)
 			}
-		} else {
-			return fmt.Errorf("Field %s is not valid or cannot be set\n", column)
+		}
+
+		if !field.CanSet() {
+			return fmt.Errorf("field %s cannot be set (might be unexported)", column)
+		}
+
+		switch field.Kind() {
+		case reflect.String:
+			switch v := value.(type) {
+			case []uint8:
+				field.SetString(string(v))
+			case string:
+				field.SetString(v)
+			default:
+				return fmt.Errorf("cannot set string field %s with value of type %T", column, value)
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			switch v := value.(type) {
+			case int64:
+				field.SetUint(uint64(v))
+			case uint64:
+				field.SetUint(v)
+			default:
+				return fmt.Errorf("cannot set uint field %s with value of type %T", column, value)
+			}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			switch v := value.(type) {
+			case int64:
+				field.SetInt(v)
+			case int:
+				field.SetInt(int64(v))
+			default:
+				return fmt.Errorf("cannot set int field %s with value of type %T", column, value)
+			}
+		case reflect.Float32, reflect.Float64:
+			v, ok := value.(float64)
+			if !ok {
+				return fmt.Errorf("cannot set float field %s with value of type %T", column, value)
+			}
+			field.SetFloat(v)
+		case reflect.Bool:
+			v, ok := value.(bool)
+			if !ok {
+				return fmt.Errorf("cannot set bool field %s with value of type %T", column, value)
+			}
+			field.SetBool(v)
+		default:
+			return fmt.Errorf("unsupported field type for %s: %v", column, field.Kind())
 		}
 	}
 	return nil
+}
+
+func toCamelCase(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+
+	n := strings.Builder{}
+	n.Grow(len(s))
+	capNext := true
+	for i, v := range []byte(s) {
+		vIsCap := v >= 'A' && v <= 'Z'
+		vIsLow := v >= 'a' && v <= 'z'
+		if capNext {
+			if vIsLow {
+				v -= 32
+			}
+		} else if i == 0 {
+			if vIsCap {
+				v += 32
+			}
+		}
+
+		if vIsCap || vIsLow {
+			n.WriteByte(v)
+			capNext = false
+		} else if vIsNum := v >= '0' && v <= '9'; vIsNum {
+			n.WriteByte(v)
+			capNext = true
+		} else {
+			capNext = v == '_' || v == ' ' || v == '-' || v == '.'
+		}
+	}
+	return n.String()
 }
