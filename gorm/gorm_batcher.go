@@ -546,10 +546,6 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
-		// Log the query and args
-		fmt.Printf("Executing query: %s\n", queryBuilder.String())
-		fmt.Printf("Query args: %v\n", args)
-
 		// Execute the query
 		rows, err := db.Raw(queryBuilder.String(), args...).Rows()
 		if err != nil {
