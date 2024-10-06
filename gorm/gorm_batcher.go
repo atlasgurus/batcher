@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -422,8 +423,7 @@ type SelectItem[T any] struct {
 	Results   *[]T
 }
 
-// NewSelectBatcher creates a new GORM select batcher
-func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context, columns []string) (*SelectBatcher[T], error) {
+func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) (*SelectBatcher[T], error) {
 	db, err := dbProvider()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get database connection: %w", err)
@@ -436,45 +436,51 @@ func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 		return nil, fmt.Errorf("failed to parse model for table name: %w", err)
 	}
 
-	// Handle column quoting
-	quotedColumns := make([]string, len(columns))
-	for i, col := range columns {
-		quotedColumns[i] = quoteIdentifier(col, db.Dialector.Name())
+	columns, err := getColumnNames(model)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get column names: %w", err)
 	}
 
 	return &SelectBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchSelect[T](dbProvider, stmt.Table, quotedColumns)),
+		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchSelect[T](dbProvider, stmt.Table, columns)),
 		tableName:  stmt.Table,
-		columns:    quotedColumns,
+		columns:    columns,
 	}, nil
 }
 
-func quoteIdentifier(identifier string, dialect string) string {
-	switch dialect {
-	case "mysql":
-		return "`" + strings.Replace(identifier, "`", "``", -1) + "`"
-	case "postgres":
-		return `"` + strings.Replace(identifier, `"`, `""`, -1) + `"`
-	case "sqlite":
-		return `"` + strings.Replace(identifier, `"`, `""`, -1) + `"`
-	default:
-		return identifier // For unsupported dialects, return the identifier as-is
+func getColumnNames(model interface{}) ([]string, error) {
+	t := reflect.TypeOf(model)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
 	}
-}
+	if t.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("model must be a struct or a pointer to a struct")
+	}
 
-func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, error) {
-	var results []T
-	item := SelectItem[T]{
-		Condition: condition,
-		Args:      args,
-		Results:   &results,
+	var columns []string
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.Anonymous {
+			continue // Skip embedded fields
+		}
+		gormTag := field.Tag.Get("gorm")
+		column := ""
+		if gormTag != "" && gormTag != "-" {
+			tagParts := strings.Split(gormTag, ";")
+			for _, part := range tagParts {
+				if strings.HasPrefix(part, "column:") {
+					column = strings.TrimPrefix(part, "column:")
+					break
+				}
+			}
+		}
+		if column == "" {
+			column = toSnakeCase(field.Name)
+		}
+		columns = append(columns, column)
 	}
-	err := b.batcher.SubmitAndWait([]SelectItem[T]{item})
-	if err != nil {
-		return nil, err
-	}
-	return results, nil
+	return columns, nil
 }
 
 func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string) func([][]SelectItem[T]) []error {
@@ -511,8 +517,12 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			if i > 0 {
 				queryBuilder.WriteString(" UNION ALL ")
 			}
-			selectColumns := append([]string{fmt.Sprintf("? AS __index")}, columns...)
-			queryBuilder.WriteString(fmt.Sprintf("SELECT %s FROM %s WHERE %s",
+			quotedColumns := make([]string, len(columns))
+			for j, col := range columns {
+				quotedColumns[j] = fmt.Sprintf("`%s`", col)
+			}
+			selectColumns := append([]string{fmt.Sprintf("CAST(? AS CHAR) AS `__index`")}, quotedColumns...)
+			queryBuilder.WriteString(fmt.Sprintf("SELECT %s FROM `%s` WHERE %s",
 				strings.Join(selectColumns, ", "),
 				tableName,
 				item.Condition))
@@ -520,7 +530,7 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			args = append(args, item.Args...)
 		}
 
-		queryBuilder.WriteString(" ORDER BY __index")
+		queryBuilder.WriteString(" ORDER BY `__index`")
 
 		// Execute the query
 		rows, err := db.Raw(queryBuilder.String(), args...).Rows()
@@ -570,17 +580,25 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 				index = int(v)
 			case uint64:
 				index = int(v)
+			case []uint8:
+				parsedIndex, err := strconv.Atoi(string(v))
+				if err != nil {
+					return batcher.RepeatErr(len(batches), fmt.Errorf("failed to parse index []uint8: %w", err))
+				}
+				index = parsedIndex
+			case string:
+				parsedIndex, err := strconv.Atoi(v)
+				if err != nil {
+					return batcher.RepeatErr(len(batches), fmt.Errorf("failed to parse index string: %w", err))
+				}
+				index = parsedIndex
 			default:
 				return batcher.RepeatErr(len(batches), fmt.Errorf("unexpected index type: %T", indexValue))
 			}
 
 			// Create a new instance of T and scan into it
 			var result T
-			unquotedColumns := make([]string, len(columns))
-			for i, col := range columns {
-				unquotedColumns[i] = strings.Trim(col, "`\"") // Remove backticks and double quotes
-			}
-			if err := scanIntoStruct(&result, unquotedColumns, values[1:]); err != nil {
+			if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
 				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan into struct: %w", err))
 			}
 
@@ -595,6 +613,20 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		return batcher.RepeatErr(len(batches), nil)
 	}
+}
+
+func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, error) {
+	var results []T
+	item := SelectItem[T]{
+		Condition: condition,
+		Args:      args,
+		Results:   &results,
+	}
+	err := b.batcher.SubmitAndWait([]SelectItem[T]{item})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 func scanIntoStruct(result interface{}, columns []string, values []interface{}) error {

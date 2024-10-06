@@ -453,7 +453,7 @@ func TestSelectBatcher(t *testing.T) {
 }
 
 func runTestModelTests(t *testing.T, ctx context.Context) {
-	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx, []string{"id", "name", "my_value"})
+	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
 	assert.NoError(t, err)
 
 	// Clean up the table before the test
@@ -482,7 +482,7 @@ func runTestModelTests(t *testing.T, ctx context.Context) {
 }
 
 func runCompositeKeyModelTests(t *testing.T, ctx context.Context) {
-	selectBatcher, err := NewSelectBatcher[CompositeKeyModel](getDBProvider(), 3, 100*time.Millisecond, ctx, []string{"id1", "id2", "name", "my_value"})
+	selectBatcher, err := NewSelectBatcher[CompositeKeyModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
 	assert.NoError(t, err)
 
 	// Clean up the table before the test
