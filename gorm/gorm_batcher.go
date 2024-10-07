@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -422,11 +423,6 @@ type SelectItem[T any] struct {
 	Results   *[]T
 }
 
-type indexedResult[T any] struct {
-	Index int
-	Data  T
-}
-
 func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context, columns []string) (*SelectBatcher[T], error) {
 	db, err := dbProvider()
 	if err != nil {
@@ -438,6 +434,23 @@ func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 	err = stmt.Parse(&model)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse model for table name: %w", err)
+	}
+
+	// Validate that all specified columns exist in the model
+	allColumns, err := getColumnNames(model)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get column names: %w", err)
+	}
+
+	columnSet := make(map[string]bool)
+	for _, col := range allColumns {
+		columnSet[col] = true
+	}
+
+	for _, col := range columns {
+		if !columnSet[col] {
+			return nil, fmt.Errorf("column %s does not exist in model", col)
+		}
 	}
 
 	return &SelectBatcher[T]{
@@ -492,22 +505,24 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 		var queryBuilder strings.Builder
 		var args []interface{}
 
+		dialectName := db.Dialector.Name()
+
 		for i, item := range allItems {
 			if i > 0 {
 				queryBuilder.WriteString(" UNION ALL ")
 			}
-			selectColumns := append([]string{fmt.Sprintf("? AS __index")}, columns...)
+			selectColumns := append([]string{fmt.Sprintf("CAST(? AS CHAR) AS %s", quoteIdentifier("__index", dialectName))}, columns...)
 			queryBuilder.WriteString(fmt.Sprintf("SELECT %s FROM %s WHERE %s",
 				strings.Join(selectColumns, ", "),
-				tableName,
+				quoteIdentifier(tableName, dialectName),
 				item.Condition))
 			args = append(args, i) // Add index as an argument
 			args = append(args, item.Args...)
 		}
 
-		queryBuilder.WriteString(" ORDER BY __index")
+		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
-		// Execute the query and scan results
+		// Execute the query
 		rows, err := db.Raw(queryBuilder.String(), args...).Rows()
 		if err != nil {
 			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to execute select query: %w", err))
@@ -520,7 +535,7 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			results[i] = make([]T, 0)
 		}
 
-		// Scan rows
+		// Scan the results
 		for rows.Next() {
 			values := make([]interface{}, len(columns)+1) // +1 for __index
 			for i := range values {
@@ -531,13 +546,20 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan row: %w", err))
 			}
 
-			index := int((*values[0].(*interface{})).(int64))
+			// Get the index
+			indexValue := reflect.ValueOf(values[0]).Elem().Interface()
+			index, err := convertToInt(indexValue)
+			if err != nil {
+				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to parse index: %w", err))
+			}
 
+			// Create a new instance of T and scan into it
 			var result T
-			if err := db.ScanRows(rows, &result); err != nil {
+			if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
 				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan into struct: %w", err))
 			}
 
+			// Append the result to the corresponding slice
 			results[index] = append(results[index], result)
 		}
 
@@ -548,4 +570,159 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		return batcher.RepeatErr(len(batches), nil)
 	}
+}
+
+func convertToInt(value interface{}) (int, error) {
+	switch v := value.(type) {
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	case uint:
+		return int(v), nil
+	case uint64:
+		return int(v), nil
+	case []uint8:
+		return strconv.Atoi(string(v))
+	case string:
+		return strconv.Atoi(v)
+	default:
+		return 0, fmt.Errorf("unexpected index type: %T", value)
+	}
+}
+
+func quoteIdentifier(identifier string, dialect string) string {
+	switch dialect {
+	case "mysql":
+		return "`" + strings.Replace(identifier, "`", "``", -1) + "`"
+	case "postgres":
+		return `"` + strings.Replace(identifier, `"`, `""`, -1) + `"`
+	case "sqlite":
+		return `"` + strings.Replace(identifier, `"`, `""`, -1) + `"`
+	default:
+		return identifier
+	}
+}
+
+func getColumnNames(model interface{}) ([]string, error) {
+	t := reflect.TypeOf(model)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("model must be a struct or a pointer to a struct")
+	}
+
+	var columns []string
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.Anonymous {
+			continue // Skip embedded fields
+		}
+		gormTag := field.Tag.Get("gorm")
+		column := ""
+		if gormTag != "" && gormTag != "-" {
+			tagParts := strings.Split(gormTag, ";")
+			for _, part := range tagParts {
+				if strings.HasPrefix(part, "column:") {
+					column = strings.TrimPrefix(part, "column:")
+					break
+				}
+			}
+		}
+		if column == "" {
+			column = toSnakeCase(field.Name)
+		}
+		columns = append(columns, column)
+	}
+	return columns, nil
+}
+
+func scanIntoStruct(result interface{}, columns []string, values []interface{}) error {
+	resultValue := reflect.ValueOf(result)
+	if resultValue.Kind() != reflect.Ptr {
+		return fmt.Errorf("result must be a pointer")
+	}
+	resultValue = resultValue.Elem()
+
+	if resultValue.Kind() == reflect.Ptr {
+		if resultValue.IsNil() {
+			resultValue.Set(reflect.New(resultValue.Type().Elem()))
+		}
+		resultValue = resultValue.Elem()
+	}
+
+	if resultValue.Kind() != reflect.Struct {
+		return fmt.Errorf("result must be a pointer to a struct")
+	}
+
+	resultType := resultValue.Type()
+
+	for i, column := range columns {
+		value := reflect.ValueOf(values[i]).Elem().Interface()
+
+		field := resultValue.FieldByNameFunc(func(name string) bool {
+			field, _ := resultType.FieldByName(name)
+			dbName := field.Tag.Get("gorm")
+			if dbName == column {
+				return true
+			}
+			return strings.EqualFold(name, column) ||
+				strings.EqualFold(toSnakeCase(name), column) ||
+				strings.EqualFold(name, strings.ReplaceAll(column, "_", ""))
+		})
+
+		if !field.IsValid() {
+			return fmt.Errorf("no field found for column %s", column)
+		}
+
+		if !field.CanSet() {
+			return fmt.Errorf("field %s cannot be set (might be unexported)", column)
+		}
+
+		switch field.Kind() {
+		case reflect.String:
+			switch v := value.(type) {
+			case []uint8:
+				field.SetString(string(v))
+			case string:
+				field.SetString(v)
+			default:
+				return fmt.Errorf("cannot set string field %s with value of type %T", column, value)
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			switch v := value.(type) {
+			case int64:
+				field.SetUint(uint64(v))
+			case uint64:
+				field.SetUint(v)
+			default:
+				return fmt.Errorf("cannot set uint field %s with value of type %T", column, value)
+			}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			switch v := value.(type) {
+			case int64:
+				field.SetInt(v)
+			case int:
+				field.SetInt(int64(v))
+			default:
+				return fmt.Errorf("cannot set int field %s with value of type %T", column, value)
+			}
+		case reflect.Float32, reflect.Float64:
+			v, ok := value.(float64)
+			if !ok {
+				return fmt.Errorf("cannot set float field %s with value of type %T", column, value)
+			}
+			field.SetFloat(v)
+		case reflect.Bool:
+			v, ok := value.(bool)
+			if !ok {
+				return fmt.Errorf("cannot set bool field %s with value of type %T", column, value)
+			}
+			field.SetBool(v)
+		default:
+			return fmt.Errorf("unsupported field type for %s: %v", column, field.Kind())
+		}
+	}
+	return nil
 }
