@@ -1,15 +1,17 @@
 # AtlasGurus Batcher
 
-AtlasGurus Batcher is a Go module that provides efficient batching functionality for various operations, with a specific implementation for GORM database operations. It consists of two main packages and a utility adapter:
+AtlasGurus Batcher is a Go module that provides efficient batching and memoization functionality for various operations, with a specific implementation for GORM database operations. It consists of three main packages and a utility adapter:
 
 1. `batcher`: A generic batching package
 2. `gorm`: A GORM-specific implementation using the batcher package
-3. GORM v1 to v2 adapter: A utility for converting GORM v1 connections to v2
+3. `memoize`: A generic, concurrent-safe memoization package
+4. GORM v1 to v2 adapter: A utility for converting GORM v1 connections to v2
 
 ## Features
 
 - Generic batching functionality with configurable batch size and wait time
 - GORM-specific batching for both insert and update operations
+- Generic, concurrent-safe memoization with support for size limits and time-based expiration
 - Support for both GORM v1 and v2
 - Concurrent operation support
 - Type-safe implementations using Go generics
@@ -92,6 +94,33 @@ if err != nil {
 }
 ```
 
+### Memoize Package
+
+The `memoize` package provides a generic, concurrent-safe memoization solution for Go functions:
+
+```go
+import (
+    "time"
+    "github.com/atlasgurus/batcher/memoize"
+)
+
+func expensiveFunction(x int) int {
+    // Some expensive computation
+    return x * 2
+}
+
+// Create a memoized version of the function
+memoizedFunc := memoize.Memoize(
+    expensiveFunction,
+    memoize.WithMaxSize(1000),
+    memoize.WithExpiration(5 * time.Minute),
+)
+
+// Use the memoized function
+result := memoizedFunc(5) // Computes and caches the result
+result = memoizedFunc(5)  // Returns the cached result
+```
+
 ### GORM v1 to v2 Adapter
 
 If you're using GORM v1, you can use the provided adapter to convert your v1 connection to v2:
@@ -130,6 +159,68 @@ Both `NewInsertBatcher` and `NewUpdateBatcher` take the following parameters:
 - `maxBatchSize`: The maximum number of items to include in a single batch
 - `maxWaitTime`: The maximum time to wait before processing a batch
 - `ctx`: A context for cancellation
+
+## Memoize Package Details
+
+The Memoize package provides additional features and considerations:
+
+### Features
+
+- Generic implementation: Works with any function type
+- Concurrent-safe: Safe for use in multi-goroutine environments
+- Size-limited cache: Prevent unbounded memory growth
+- Time-based expiration: Automatically expire cached results
+- Least Recently Used (LRU) eviction policy
+
+### Options
+
+`Memoize` function accepts the following options:
+
+- `WithMaxSize(size int)`: Sets the maximum number of results to cache
+- `WithExpiration(d time.Duration)`: Sets the expiration time for cached results
+
+### Examples
+
+#### Memoizing a Function with Multiple Arguments and Return Values
+
+```go
+func complexFunc(a int, b string) (int, error) {
+    // Some complex computation
+    return len(b) + a, nil
+}
+
+memoized := memoize.Memoize(complexFunc)
+
+result, err := memoized(5, "hello")
+// result is cached
+result, err = memoized(5, "hello") // Returns cached result
+```
+
+#### Using Expiration
+
+```go
+memoized := memoize.Memoize(
+    expensiveFunction,
+    memoize.WithExpiration(1 * time.Minute),
+)
+
+result := memoized(10)
+// Result is cached for 1 minute
+time.Sleep(2 * time.Minute)
+result = memoized(10) // Recomputes after expiration
+```
+
+### Best Practices
+
+1. Use memoization for pure functions (same input always produces the same output).
+2. Be mindful of memory usage when memoizing functions with large return values.
+3. Choose appropriate size limits and expiration times based on your use case.
+4. Avoid memoizing functions with side effects.
+
+### Limitations
+
+- The cache key is based on function arguments, so be cautious with functions that take pointer or reference types as arguments.
+- Very large caches may impact performance due to the overhead of cache management.
 
 ## Contributing
 
