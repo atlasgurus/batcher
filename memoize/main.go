@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,8 +22,9 @@ type cacheEntry struct {
 type Option func(*memoizeOptions)
 
 type memoizeOptions struct {
-	maxSize    int
-	expiration time.Duration
+	maxSize        int
+	expiration     time.Duration
+	metricCallback MetricCallback
 }
 
 func WithMaxSize(size int) Option {
@@ -37,7 +39,22 @@ func WithExpiration(d time.Duration) Option {
 	}
 }
 
-// Memoize takes a function of any type and returns a memoized version of it.
+// MemoMetrics now uses atomic int64 for counters
+type MemoMetrics struct {
+	Hits       atomic.Int64
+	Misses     atomic.Int64
+	Evictions  atomic.Int64
+	TotalItems int // This is set during cleanup, so it doesn't need to be atomic
+}
+
+type MetricCallback func(*MemoMetrics)
+
+func WithMetricCallback(callback MetricCallback) Option {
+	return func(o *memoizeOptions) {
+		o.metricCallback = callback
+	}
+}
+
 func Memoize[F any](f F, options ...Option) F {
 	ft := reflect.TypeOf(f)
 	if ft.Kind() != reflect.Func {
@@ -45,8 +62,8 @@ func Memoize[F any](f F, options ...Option) F {
 	}
 
 	opts := memoizeOptions{
-		maxSize:    100,       // Default max size
-		expiration: time.Hour, // Default expiration
+		maxSize:    100,
+		expiration: time.Hour,
 	}
 	for _, option := range options {
 		option(&opts)
@@ -55,6 +72,8 @@ func Memoize[F any](f F, options ...Option) F {
 	cache := &sync.Map{}
 	lru := list.New()
 	var mutex sync.Mutex
+
+	metrics := MemoMetrics{}
 
 	cleanup := func() {
 		mutex.Lock()
@@ -67,10 +86,20 @@ func Memoize[F any](f F, options ...Option) F {
 			if now.After(entry.expireAt) || lru.Len() > opts.maxSize {
 				lru.Remove(oldest)
 				cache.Delete(entry.key)
+				metrics.Evictions.Add(1)
 			} else {
 				break
 			}
 		}
+
+		metrics.TotalItems = lru.Len()
+		if opts.metricCallback != nil {
+			opts.metricCallback(&metrics)
+		}
+		// Reset counters after reporting
+		metrics.Hits.Store(0)
+		metrics.Misses.Store(0)
+		metrics.Evictions.Store(0)
 	}
 
 	go func() {
@@ -91,6 +120,7 @@ func Memoize[F any](f F, options ...Option) F {
 				mutex.Lock()
 				lru.MoveToFront(entry.element)
 				mutex.Unlock()
+				metrics.Hits.Add(1)
 				return entry.result
 			}
 			// Entry has expired, remove it
@@ -98,6 +128,7 @@ func Memoize[F any](f F, options ...Option) F {
 			lru.Remove(entry.element)
 			cache.Delete(entry.key)
 			mutex.Unlock()
+			metrics.Evictions.Add(1)
 		}
 
 		// Compute the result
@@ -110,6 +141,7 @@ func Memoize[F any](f F, options ...Option) F {
 			entry = actual.(*cacheEntry)
 			<-entry.ready // Wait for the result to be ready
 			if now.Before(entry.expireAt) {
+				metrics.Hits.Add(1)
 				return entry.result
 			}
 			// Entry has expired, remove it and recompute
@@ -117,6 +149,7 @@ func Memoize[F any](f F, options ...Option) F {
 			lru.Remove(entry.element)
 			cache.Delete(entry.key)
 			mutex.Unlock()
+			metrics.Evictions.Add(1)
 		} else {
 			defer close(entry.ready) // Signal that the result is ready
 			entry.result = reflect.ValueOf(f).Call(args)
@@ -127,10 +160,12 @@ func Memoize[F any](f F, options ...Option) F {
 				oldestEntry := oldest.Value.(*cacheEntry)
 				lru.Remove(oldest)
 				cache.Delete(oldestEntry.key)
+				metrics.Evictions.Add(1)
 			}
 			entry.element = lru.PushFront(entry)
 			mutex.Unlock()
 
+			metrics.Misses.Add(1)
 			return entry.result
 		}
 
@@ -150,10 +185,12 @@ func Memoize[F any](f F, options ...Option) F {
 			oldestEntry := oldest.Value.(*cacheEntry)
 			lru.Remove(oldest)
 			cache.Delete(oldestEntry.key)
+			metrics.Evictions.Add(1)
 		}
 		newEntry.element = lru.PushFront(newEntry)
 		mutex.Unlock()
 
+		metrics.Misses.Add(1)
 		return newEntry.result
 	})
 
