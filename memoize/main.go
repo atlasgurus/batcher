@@ -71,7 +71,7 @@ func Memoize[F any](f F, options ...Option) F {
 		option(&opts)
 	}
 
-	cache := &sync.Map{}
+	cache := make(map[string]*cacheEntry)
 	lru := list.New()
 	var mutex sync.Mutex
 
@@ -82,22 +82,14 @@ func Memoize[F any](f F, options ...Option) F {
 	}
 
 	cleanup := func() {
-		mutex.Lock()
-		defer mutex.Unlock()
-
 		now := time.Now()
-		for lru.Len() > 0 {
+		for lru.Len() > 0 && (lru.Len() > opts.maxSize || now.After(lru.Back().Value.(*cacheEntry).expireAt)) {
 			oldest := lru.Back()
 			entry := oldest.Value.(*cacheEntry)
-			if now.After(entry.expireAt) || lru.Len() > opts.maxSize {
-				lru.Remove(oldest)
-				cache.Delete(entry.key)
-				metrics.Evictions.Add(1)
-			} else {
-				break
-			}
+			lru.Remove(oldest)
+			delete(cache, entry.key)
+			metrics.Evictions.Add(1)
 		}
-
 		metrics.TotalItems = lru.Len()
 	}
 
@@ -110,89 +102,36 @@ func Memoize[F any](f F, options ...Option) F {
 
 		key := makeKey(args)
 
+		mutex.Lock()
+		defer mutex.Unlock()
+
 		now := time.Now()
-		if value, found := cache.Load(key); found {
-			entry := value.(*cacheEntry)
-			if now.Before(entry.expireAt) {
-				<-entry.ready // Wait for the result to be ready
-				mutex.Lock()
-				lru.MoveToFront(entry.element)
-				mutex.Unlock()
-				metrics.Hits.Add(1)
-				return entry.result
-			}
-			// Entry has expired, remove it
-			mutex.Lock()
-			lru.Remove(entry.element)
-			cache.Delete(entry.key)
-			mutex.Unlock()
-			metrics.Evictions.Add(1)
-		}
-
-		// Perform cleanup before adding a new entry
-		cleanup()
-
-		// Compute the result
-		entry := &cacheEntry{
-			key:      key,
-			ready:    make(chan struct{}),
-			expireAt: now.Add(opts.expiration),
-		}
-		if actual, loaded := cache.LoadOrStore(key, entry); loaded {
-			entry = actual.(*cacheEntry)
-			<-entry.ready // Wait for the result to be ready
-			if now.Before(entry.expireAt) {
-				metrics.Hits.Add(1)
-				return entry.result
-			}
-			// Entry has expired, remove it and recompute
-			mutex.Lock()
-			lru.Remove(entry.element)
-			cache.Delete(entry.key)
-			mutex.Unlock()
-			metrics.Evictions.Add(1)
-		} else {
-			defer close(entry.ready) // Signal that the result is ready
-			entry.result = reflect.ValueOf(f).Call(args)
-
-			mutex.Lock()
-			if lru.Len() >= opts.maxSize {
-				oldest := lru.Back()
-				oldestEntry := oldest.Value.(*cacheEntry)
-				lru.Remove(oldest)
-				cache.Delete(oldestEntry.key)
-				metrics.Evictions.Add(1)
-			}
-			entry.element = lru.PushFront(entry)
-			mutex.Unlock()
-
-			metrics.Misses.Add(1)
+		if entry, found := cache[key]; found && now.Before(entry.expireAt) {
+			lru.MoveToFront(entry.element)
+			metrics.Hits.Add(1)
 			return entry.result
 		}
 
-		// Recompute if entry was expired
-		newEntry := &cacheEntry{
-			key:      key,
-			ready:    make(chan struct{}),
-			expireAt: now.Add(opts.expiration),
-		}
-		cache.Store(key, newEntry)
-		defer close(newEntry.ready)
-		newEntry.result = reflect.ValueOf(f).Call(args)
+		cleanup()
 
-		mutex.Lock()
+		entry := &cacheEntry{
+			key:      key,
+			expireAt: now.Add(opts.expiration),
+			result:   reflect.ValueOf(f).Call(args),
+		}
+
 		if lru.Len() >= opts.maxSize {
 			oldest := lru.Back()
-			oldestEntry := oldest.Value.(*cacheEntry)
+			delete(cache, oldest.Value.(*cacheEntry).key)
 			lru.Remove(oldest)
-			cache.Delete(oldestEntry.key)
 			metrics.Evictions.Add(1)
 		}
-		newEntry.element = lru.PushFront(newEntry)
-		mutex.Unlock()
 
+		entry.element = lru.PushFront(entry)
+		cache[key] = entry
 		metrics.Misses.Add(1)
-		return newEntry.result
+
+		return entry.result
 	})
 
 	return wrapped.Interface().(F)
