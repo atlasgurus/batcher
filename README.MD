@@ -160,28 +160,100 @@ Both `NewInsertBatcher` and `NewUpdateBatcher` take the following parameters:
 - `maxWaitTime`: The maximum time to wait before processing a batch
 - `ctx`: A context for cancellation
 
-## Memoize Package Details
+### Memoize Package
 
-The Memoize package provides additional features and considerations:
+The `memoize` package provides a generic, concurrent-safe memoization solution for Go functions:
 
-### Features
+```go
+import (
+    "time"
+    "github.com/atlasgurus/batcher/memoize"
+)
+
+func expensiveFunction(x int) int {
+    // Some expensive computation
+    return x * 2
+}
+
+// Create a memoized version of the function
+memoizedFunc := memoize.Memoize(
+    expensiveFunction,
+    memoize.WithMaxSize(1000),
+    memoize.WithExpiration(5 * time.Minute),
+)
+
+// Use the memoized function
+result := memoizedFunc(5) // Computes and caches the result
+result = memoizedFunc(5)  // Returns the cached result
+```
+
+#### Features
 
 - Generic implementation: Works with any function type
 - Concurrent-safe: Safe for use in multi-goroutine environments
 - Size-limited cache: Prevent unbounded memory growth
 - Time-based expiration: Automatically expire cached results
 - Least Recently Used (LRU) eviction policy
+- Metrics collection: Support for custom metrics collectors, including Prometheus
 
-### Options
+#### Options
 
 `Memoize` function accepts the following options:
 
 - `WithMaxSize(size int)`: Sets the maximum number of results to cache
 - `WithExpiration(d time.Duration)`: Sets the expiration time for cached results
+- `WithMetrics(collector MetricsCollector)`: Sets a custom metrics collector
 
-### Examples
+#### Prometheus Metrics
 
-#### Memoizing a Function with Multiple Arguments and Return Values
+The package includes a built-in Prometheus metrics collector:
+
+```go
+import (
+    "github.com/atlasgurus/batcher/memoize"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+    "net/http"
+)
+
+func main() {
+    promCollector := memoize.NewPrometheusMetricsCollector("my_function")
+    
+    memoizedFunc := memoize.Memoize(expensiveFunction,
+        memoize.WithMaxSize(1000),
+        memoize.WithExpiration(5*time.Minute),
+        memoize.WithMetrics(promCollector))
+
+    // Use memoizedFunc as needed
+
+    // Expose Prometheus metrics
+    http.Handle("/metrics", promhttp.Handler())
+    http.ListenAndServe(":8080", nil)
+}
+```
+
+This setup creates the following Prometheus metrics:
+
+- `my_function_memoize_hits_total`: Total number of cache hits
+- `my_function_memoize_misses_total`: Total number of cache misses
+- `my_function_memoize_evictions_total`: Total number of cache evictions
+- `my_function_memoize_total_items`: Current number of items in the cache
+
+#### Custom Metrics Collectors
+
+You can implement your own metrics collector by implementing the `MetricsCollector` interface:
+
+```go
+type MetricsCollector interface {
+    Setup(function interface{})
+    Collect(metrics *MemoMetrics)
+}
+```
+
+This allows for integration with various monitoring systems beyond Prometheus.
+
+#### Examples
+
+Memoizing a Function with Multiple Arguments and Return Values:
 
 ```go
 func complexFunc(a int, b string) (int, error) {
@@ -196,7 +268,7 @@ result, err := memoized(5, "hello")
 result, err = memoized(5, "hello") // Returns cached result
 ```
 
-#### Using Expiration
+Using Expiration:
 
 ```go
 memoized := memoize.Memoize(
@@ -210,18 +282,19 @@ time.Sleep(2 * time.Minute)
 result = memoized(10) // Recomputes after expiration
 ```
 
-### Best Practices
+#### Best Practices
 
 1. Use memoization for pure functions (same input always produces the same output).
 2. Be mindful of memory usage when memoizing functions with large return values.
 3. Choose appropriate size limits and expiration times based on your use case.
 4. Avoid memoizing functions with side effects.
+5. Use metrics to monitor cache performance and adjust settings as needed.
 
-### Limitations
+#### Limitations
 
 - The cache key is based on function arguments, so be cautious with functions that take pointer or reference types as arguments.
 - Very large caches may impact performance due to the overhead of cache management.
-
+- Metric collection may have a small performance impact, especially with high-throughput functions.
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

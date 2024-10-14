@@ -22,9 +22,9 @@ type cacheEntry struct {
 type Option func(*memoizeOptions)
 
 type memoizeOptions struct {
-	maxSize        int
-	expiration     time.Duration
-	metricCallback MetricCallback
+	maxSize    int
+	expiration time.Duration
+	metrics    MetricsCollector
 }
 
 func WithMaxSize(size int) Option {
@@ -39,19 +39,21 @@ func WithExpiration(d time.Duration) Option {
 	}
 }
 
-// MemoMetrics now uses atomic int64 for counters
 type MemoMetrics struct {
 	Hits       atomic.Int64
 	Misses     atomic.Int64
 	Evictions  atomic.Int64
-	TotalItems int // This is set during cleanup, so it doesn't need to be atomic
+	TotalItems int
 }
 
-type MetricCallback func(*MemoMetrics)
+type MetricsCollector interface {
+	Setup(function interface{})
+	Collect(metrics *MemoMetrics)
+}
 
-func WithMetricCallback(callback MetricCallback) Option {
+func WithMetrics(collector MetricsCollector) Option {
 	return func(o *memoizeOptions) {
-		o.metricCallback = callback
+		o.metrics = collector
 	}
 }
 
@@ -75,6 +77,10 @@ func Memoize[F any](f F, options ...Option) F {
 
 	metrics := MemoMetrics{}
 
+	if opts.metrics != nil {
+		opts.metrics.Setup(f)
+	}
+
 	cleanup := func() {
 		mutex.Lock()
 		defer mutex.Unlock()
@@ -93,8 +99,8 @@ func Memoize[F any](f F, options ...Option) F {
 		}
 
 		metrics.TotalItems = lru.Len()
-		if opts.metricCallback != nil {
-			opts.metricCallback(&metrics)
+		if opts.metrics != nil {
+			opts.metrics.Collect(&metrics)
 		}
 		// Reset counters after reporting
 		metrics.Hits.Store(0)
