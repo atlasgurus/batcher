@@ -442,8 +442,8 @@ func TestMemoizeWithContext(t *testing.T) {
 }
 
 type MockMetricsCollector struct {
-	setupCalled  bool
 	metrics      MemoMetrics
+	setupCalled  bool
 	collectCalls int
 }
 
@@ -453,9 +453,9 @@ func (m *MockMetricsCollector) Setup(function interface{}) {
 
 func (m *MockMetricsCollector) Collect(metrics *MemoMetrics) {
 	m.collectCalls++
-	m.metrics.Hits.Add(metrics.Hits.Load())
-	m.metrics.Misses.Add(metrics.Misses.Load())
-	m.metrics.Evictions.Add(metrics.Evictions.Load())
+	m.metrics.Hits.Store(metrics.Hits.Load())
+	m.metrics.Misses.Store(metrics.Misses.Load())
+	m.metrics.Evictions.Store(metrics.Evictions.Load())
 	m.metrics.TotalItems = metrics.TotalItems
 }
 
@@ -491,8 +491,7 @@ func TestMemoizeWithMetrics(t *testing.T) {
 	// Verify metrics
 	expectedHits := int64(2)
 	expectedMisses := int64(3)
-	expectedEvictions := int64(3) // Adjusted expectation
-	// We don't check TotalItems as it might be 0 after cleanup
+	expectedEvictions := int64(1) // 1 eviction when 3 is added
 
 	if hits := mockCollector.metrics.Hits.Load(); hits != expectedHits {
 		t.Errorf("Expected %d hits, got %d", expectedHits, hits)

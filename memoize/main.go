@@ -75,7 +75,7 @@ func Memoize[F any](f F, options ...Option) F {
 	lru := list.New()
 	var mutex sync.Mutex
 
-	metrics := MemoMetrics{}
+	metrics := &MemoMetrics{}
 
 	if opts.metrics != nil {
 		opts.metrics.Setup(f)
@@ -99,23 +99,15 @@ func Memoize[F any](f F, options ...Option) F {
 		}
 
 		metrics.TotalItems = lru.Len()
-		if opts.metrics != nil {
-			opts.metrics.Collect(&metrics)
-		}
-		// Reset counters after reporting
-		metrics.Hits.Store(0)
-		metrics.Misses.Store(0)
-		metrics.Evictions.Store(0)
 	}
 
-	go func() {
-		for {
-			time.Sleep(opts.expiration / 10)
-			cleanup()
-		}
-	}()
-
 	wrapped := reflect.MakeFunc(ft, func(args []reflect.Value) []reflect.Value {
+		defer func() {
+			if opts.metrics != nil {
+				opts.metrics.Collect(metrics)
+			}
+		}()
+
 		key := makeKey(args)
 
 		now := time.Now()
@@ -136,6 +128,9 @@ func Memoize[F any](f F, options ...Option) F {
 			mutex.Unlock()
 			metrics.Evictions.Add(1)
 		}
+
+		// Perform cleanup before adding a new entry
+		cleanup()
 
 		// Compute the result
 		entry := &cacheEntry{
