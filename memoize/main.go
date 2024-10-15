@@ -12,11 +12,12 @@ import (
 )
 
 type cacheEntry struct {
-	key      string
-	result   []reflect.Value
-	ready    chan struct{}
-	expireAt time.Time
-	element  *list.Element
+	key       string
+	result    []reflect.Value
+	ready     chan struct{}
+	expireAt  time.Time
+	element   *list.Element
+	computing bool
 }
 
 type Option func(*memoizeOptions)
@@ -71,7 +72,7 @@ func Memoize[F any](f F, options ...Option) F {
 		option(&opts)
 	}
 
-	cache := make(map[string]*cacheEntry)
+	cache := make(map[string]*list.Element)
 	lru := list.New()
 	var mutex sync.Mutex
 
@@ -82,13 +83,13 @@ func Memoize[F any](f F, options ...Option) F {
 	}
 
 	cleanup := func() {
-		now := time.Now()
-		for lru.Len() > 0 && (lru.Len() > opts.maxSize || now.After(lru.Back().Value.(*cacheEntry).expireAt)) {
+		for lru.Len() > opts.maxSize {
 			oldest := lru.Back()
-			entry := oldest.Value.(*cacheEntry)
-			lru.Remove(oldest)
-			delete(cache, entry.key)
-			metrics.Evictions.Add(1)
+			if oldest != nil {
+				lru.Remove(oldest)
+				delete(cache, oldest.Value.(*cacheEntry).key)
+				metrics.Evictions.Add(1)
+			}
 		}
 		metrics.TotalItems = lru.Len()
 	}
@@ -103,35 +104,58 @@ func Memoize[F any](f F, options ...Option) F {
 		key := makeKey(args)
 
 		mutex.Lock()
-		defer mutex.Unlock()
-
+		element, found := cache[key]
 		now := time.Now()
-		if entry, found := cache[key]; found && now.Before(entry.expireAt) {
-			lru.MoveToFront(entry.element)
+
+		if found {
+			entry := element.Value.(*cacheEntry)
+			if now.Before(entry.expireAt) {
+				lru.MoveToFront(element)
+				readyChan := entry.ready
+				mutex.Unlock()
+				<-readyChan // Wait for the result to be ready
+				metrics.Hits.Add(1)
+				return entry.result
+			}
+			// Entry has expired, remove it
+			lru.Remove(element)
+			delete(cache, key)
+			found = false
+		}
+
+		var entry *cacheEntry
+		if !found {
+			// Create a new entry
+			entry = &cacheEntry{
+				key:       key,
+				ready:     make(chan struct{}),
+				computing: true,
+			}
+			element = lru.PushFront(entry)
+			cache[key] = element
+			mutex.Unlock()
+
+			// Compute the result
+			result := reflect.ValueOf(f).Call(args)
+
+			mutex.Lock()
+			entry.result = result
+			entry.expireAt = now.Add(opts.expiration)
+			entry.computing = false
+			cleanup()          // Clean up after adding new entry
+			close(entry.ready) // Signal that the result is ready
+			mutex.Unlock()
+
+			metrics.Misses.Add(1)
+			return result
+		} else {
+			// Another goroutine is computing, wait for it
+			readyChan := entry.ready
+			mutex.Unlock()
+			<-readyChan // Wait for the result to be ready
 			metrics.Hits.Add(1)
 			return entry.result
 		}
-
-		cleanup()
-
-		entry := &cacheEntry{
-			key:      key,
-			expireAt: now.Add(opts.expiration),
-			result:   reflect.ValueOf(f).Call(args),
-		}
-
-		if lru.Len() >= opts.maxSize {
-			oldest := lru.Back()
-			delete(cache, oldest.Value.(*cacheEntry).key)
-			lru.Remove(oldest)
-			metrics.Evictions.Add(1)
-		}
-
-		entry.element = lru.PushFront(entry)
-		cache[key] = entry
-		metrics.Misses.Add(1)
-
-		return entry.result
 	})
 
 	return wrapped.Interface().(F)

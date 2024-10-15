@@ -260,6 +260,7 @@ func TestMemoizeWithExpiration(t *testing.T) {
 		t.Errorf("Fourth call: Expected result 2 and calls 2, got result %d and calls %d", result, calls)
 	}
 }
+
 func TestMemoizeWithSizeLimitAndExpiration(t *testing.T) {
 	var calls int64
 	f := func(x int) int {
