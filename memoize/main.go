@@ -83,7 +83,8 @@ func Memoize[F any](f F, options ...Option) F {
 	}
 
 	cleanup := func() {
-		for lru.Len() > opts.maxSize {
+		now := time.Now()
+		for lru.Len() > opts.maxSize || (lru.Len() > 0 && now.After(lru.Back().Value.(*cacheEntry).expireAt)) {
 			oldest := lru.Back()
 			if oldest != nil {
 				lru.Remove(oldest)
@@ -120,42 +121,31 @@ func Memoize[F any](f F, options ...Option) F {
 			// Entry has expired, remove it
 			lru.Remove(element)
 			delete(cache, key)
-			found = false
 		}
 
-		var entry *cacheEntry
-		if !found {
-			// Create a new entry
-			entry = &cacheEntry{
-				key:       key,
-				ready:     make(chan struct{}),
-				computing: true,
-			}
-			element = lru.PushFront(entry)
-			cache[key] = element
-			mutex.Unlock()
-
-			// Compute the result
-			result := reflect.ValueOf(f).Call(args)
-
-			mutex.Lock()
-			entry.result = result
-			entry.expireAt = now.Add(opts.expiration)
-			entry.computing = false
-			cleanup()          // Clean up after adding new entry
-			close(entry.ready) // Signal that the result is ready
-			mutex.Unlock()
-
-			metrics.Misses.Add(1)
-			return result
-		} else {
-			// Another goroutine is computing, wait for it
-			readyChan := entry.ready
-			mutex.Unlock()
-			<-readyChan // Wait for the result to be ready
-			metrics.Hits.Add(1)
-			return entry.result
+		// Create a new entry or reuse the expired one
+		entry := &cacheEntry{
+			key:       key,
+			ready:     make(chan struct{}),
+			computing: true,
+			expireAt:  now.Add(opts.expiration), // Set the expiration time when creating the entry
 		}
+		element = lru.PushFront(entry)
+		cache[key] = element
+		mutex.Unlock()
+
+		// Compute the result
+		result := reflect.ValueOf(f).Call(args)
+
+		mutex.Lock()
+		entry.result = result
+		entry.computing = false
+		cleanup()          // Clean up after adding new entry
+		close(entry.ready) // Signal that the result is ready
+		mutex.Unlock()
+
+		metrics.Misses.Add(1)
+		return result
 	})
 
 	return wrapped.Interface().(F)
