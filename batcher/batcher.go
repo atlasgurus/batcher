@@ -8,6 +8,7 @@ import (
 // BatchProcessorInterface defines the common interface for batch processors
 type BatchProcessorInterface[T any] interface {
 	SubmitAndWait(item T) error
+	Submit(item T, callback func(error))
 }
 
 // BatchProcessor is a generic batch processor
@@ -54,6 +55,23 @@ func (bp *BatchProcessor[T]) SubmitAndWait(item T) error {
 	case <-bp.ctx.Done():
 		// Process the item directly when the context is canceled
 		return bp.processFn([]T{item})[0]
+	}
+}
+
+// Submit submits an item for processing and calls the callback function when done.
+// If the context is canceled, it processes the item directly.
+// The function is non-blocking
+func (bp *BatchProcessor[T]) Submit(item T, callback func(error)) {
+	respChan := make(chan error, 1)
+	select {
+	case bp.input <- batchItem[T]{item: item, resp: respChan}:
+		go func() {
+			callback(<-respChan)
+		}()
+	case <-bp.ctx.Done():
+		go func() {
+			callback(bp.processFn([]T{item})[0])
+		}()
 	}
 }
 
