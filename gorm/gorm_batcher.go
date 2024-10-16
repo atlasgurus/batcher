@@ -107,6 +107,11 @@ func (b *InsertBatcher[T]) Insert(items ...T) error {
 	return b.batcher.SubmitAndWait(items)
 }
 
+// InsertAsync non-blocking version of Insert with a callback
+func (b *InsertBatcher[T]) InsertAsync(callback func(error), items ...T) {
+	b.batcher.Submit(items, callback)
+}
+
 // Update submits one or more items for batch update
 func (b *UpdateBatcher[T]) Update(items []T, updateFields []string) error {
 	updateItems := make([]UpdateItem[T], len(items))
@@ -114,6 +119,15 @@ func (b *UpdateBatcher[T]) Update(items []T, updateFields []string) error {
 		updateItems[i] = UpdateItem[T]{Item: item, UpdateFields: updateFields}
 	}
 	return b.batcher.SubmitAndWait(updateItems)
+}
+
+// UpdateAsync non-blocking version of Update with a callback
+func (b *UpdateBatcher[T]) UpdateAsync(callback func(error), items []T, updateFields []string) {
+	updateItems := make([]UpdateItem[T], len(items))
+	for i, item := range items {
+		updateItems[i] = UpdateItem[T]{Item: item, UpdateFields: updateFields}
+	}
+	b.batcher.Submit(updateItems, callback)
 }
 
 const (
@@ -473,6 +487,19 @@ func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, e
 		return nil, err
 	}
 	return results, nil
+}
+
+// SelectAsync non-blocking version of Select with a callback
+func (b *SelectBatcher[T]) SelectAsync(callback func([]T, error), condition string, args ...interface{}) {
+	var results []T
+	item := SelectItem[T]{
+		Condition: condition,
+		Args:      args,
+		Results:   &results,
+	}
+	b.batcher.Submit([]SelectItem[T]{item}, func(err error) {
+		callback(results, err)
+	})
 }
 
 func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string) func([][]SelectItem[T]) []error {

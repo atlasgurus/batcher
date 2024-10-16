@@ -125,4 +125,125 @@ func TestBatchProcessor(t *testing.T) {
 		assert.Len(t, processed, 2)
 		assert.Equal(t, []int{1, 2}, processed)
 	})
+
+	t.Run("ProcessAsync", func(t *testing.T) {
+		ctx := context.Background()
+		processor := NewBatchProcessor(
+			5,
+			100*time.Millisecond,
+			ctx,
+			func(items []int) []error {
+				return make([]error, len(items))
+			},
+		)
+
+		done := make(chan bool)
+		processor.Submit(1, func(err error) {
+			assert.NoError(t, err)
+			done <- true
+		})
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("timeout waiting for callback")
+		}
+	})
+
+	t.Run("ProcessAsyncContextCancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		processor := NewBatchProcessor(
+			5,
+			100*time.Millisecond,
+			ctx,
+			func(items []int) []error {
+				return make([]error, len(items))
+			},
+		)
+
+		done := make(chan bool)
+		cancel()
+		processor.Submit(1, func(err error) {
+			assert.NoError(t, err)
+			done <- true
+		})
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("timeout waiting for callback")
+		}
+	})
+
+	t.Run("ProcessAsyncError", func(t *testing.T) {
+		ctx := context.Background()
+		expectedError := errors.New("processing error")
+		processor := NewBatchProcessor(
+			5,
+			100*time.Millisecond,
+			ctx,
+			func(items []int) []error {
+				return RepeatErr(len(items), expectedError)
+			},
+		)
+
+		done := make(chan bool)
+		processor.Submit(1, func(err error) {
+			assert.Equal(t, expectedError, err)
+			done <- true
+		})
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("timeout waiting for callback")
+		}
+	})
+
+	t.Run("ProcessAsyncMultipleWithErrorsAndSuccess", func(t *testing.T) {
+		ctx := context.Background()
+		expectedError := errors.New("processing error")
+		processor := NewBatchProcessor(
+			5,
+			100*time.Millisecond,
+			ctx,
+			func(items []int) []error {
+				errs := make([]error, len(items))
+				for i, item := range items {
+					if item%3 == 0 {
+						errs[i] = expectedError
+					} else {
+						errs[i] = nil
+					}
+				}
+				return errs
+			},
+		)
+
+		const items = 100
+		done := make([]chan bool, items)
+		for i := range done {
+			done[i] = make(chan bool)
+		}
+
+		for i := 0; i < items; i++ {
+			go func(index int) {
+				processor.Submit(index, func(err error) {
+					if index%3 == 0 {
+						assert.Equal(t, expectedError, err)
+					} else {
+						assert.NoError(t, err)
+					}
+					done[index] <- true
+				})
+			}(i)
+		}
+
+		timeout := time.After(5 * time.Second)
+		for i := 0; i < items; i++ {
+			select {
+			case <-done[i]:
+			case <-timeout:
+				t.Error("timeout waiting for all callbacks")
+				return
+			}
+		}
+	})
 }

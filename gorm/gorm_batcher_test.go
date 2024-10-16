@@ -133,6 +133,85 @@ func TestInsertBatcher(t *testing.T) {
 	}
 }
 
+func TestInsertBatcherAsync(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher := NewInsertBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert single items asynchronously
+	var wg sync.WaitGroup
+	for i := 1; i <= 3; i++ {
+		wg.Add(1)
+		id := uint(rand.Uint32())
+		model := &TestModel{ID: id, Name: fmt.Sprintf("Async Single %d", i), MyValue: i}
+		batcher.InsertAsync(func(err error) {
+			assert.NoError(t, err)
+			assert.Equal(t, id, model.ID)
+			wg.Done()
+		}, model)
+	}
+
+	// Insert multiple items at once asynchronously
+	multipleItems := []*TestModel{
+		{Name: "Async Multiple 1", MyValue: 4},
+		{Name: "Async Multiple 2", MyValue: 5},
+	}
+	wg.Add(1)
+	batcher.InsertAsync(func(err error) {
+		assert.NoError(t, err)
+		wg.Done()
+	}, multipleItems...)
+
+	// Wait for all async operations to complete
+	wg.Wait()
+
+	// Check if all items were inserted
+	var count int64
+	db.Model(&TestModel{}).Count(&count)
+	assert.Equal(t, int64(5), count)
+
+	var insertedModels []TestModel
+	db.Order("my_value asc").Find(&insertedModels)
+	assert.Len(t, insertedModels, 5)
+	for i, model := range insertedModels {
+		if i < 3 {
+			assert.Equal(t, fmt.Sprintf("Async Single %d", i+1), model.Name)
+			assert.Equal(t, i+1, model.MyValue)
+		} else {
+			assert.Equal(t, fmt.Sprintf("Async Multiple %d", i-2), model.Name)
+			assert.Equal(t, i+1, model.MyValue)
+		}
+	}
+}
+
+func TestInsertBatcherAsyncError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create a batcher with a faulty DBProvider
+	faultyDBProvider := func() (*gormv2.DB, error) {
+		return nil, fmt.Errorf("simulated database connection error")
+	}
+	batcher := NewInsertBatcher[*TestModel](faultyDBProvider, 3, 100*time.Millisecond, ctx)
+
+	// Attempt to insert an item asynchronously
+	var wg sync.WaitGroup
+	wg.Add(1)
+	model := &TestModel{ID: uint(rand.Uint32()), Name: "Faulty Insert", MyValue: 1}
+	batcher.InsertAsync(func(err error) {
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "simulated database connection error")
+		wg.Done()
+	}, model)
+
+	// Wait for the async operation to complete
+	wg.Wait()
+}
+
 func TestUpdateBatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -181,6 +260,60 @@ func TestUpdateBatcher(t *testing.T) {
 	}
 }
 
+func TestUpdateBatcherAsync(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert some initial data
+	initialModels := []*TestModel{
+		{Name: "Test 1", MyValue: 10},
+		{Name: "Test 2", MyValue: 20},
+		{Name: "Test 3", MyValue: 30},
+		{Name: "Test 4", MyValue: 40},
+		{Name: "Test 5", MyValue: 50},
+	}
+	db.Create(&initialModels)
+
+	// Update single items asynchronously
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		initialModels[i].MyValue += 5
+		batcher.UpdateAsync(func(err error) {
+			assert.NoError(t, err)
+			wg.Done()
+		}, []*TestModel{initialModels[i]}, []string{"MyValue"})
+	}
+
+	// Update multiple items at once asynchronously
+	for i := 3; i < 5; i++ {
+		initialModels[i].MyValue += 10
+	}
+	wg.Add(1)
+	batcher.UpdateAsync(func(err error) {
+		assert.NoError(t, err)
+		wg.Done()
+	}, []*TestModel{initialModels[3], initialModels[4]}, []string{"MyValue"})
+
+	// Wait for all async operations to complete
+	wg.Wait()
+
+	// Check if all items were updated correctly
+	var updatedModels []TestModel
+	db.Find(&updatedModels)
+	assert.Len(t, updatedModels, 5)
+	for i, model := range updatedModels {
+		assert.Equal(t, initialModels[i].MyValue, model.MyValue)
+		assert.Equal(t, fmt.Sprintf("Test %d", i+1), model.Name)
+	}
+}
+
 func TestUpdateBatcherBadInput(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -200,6 +333,32 @@ func TestUpdateBatcherBadInput(t *testing.T) {
 	initialModels[0].MyValue += 5
 	err = batcher.Update([]*TestModel{initialModels[0]}, []string{"MyValue", "NonExistentField"})
 	assert.ErrorContains(t, err, "field NonExistentField not found")
+}
+
+func TestUpdateAsyncBatcherBadInput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert some initial data
+	initialModels := []*TestModel{
+		{Name: "Test 1", MyValue: 10},
+	}
+	db.Create(&initialModels)
+
+	initialModels[0].MyValue += 5
+	var wg sync.WaitGroup
+	wg.Add(1)
+	batcher.UpdateAsync(func(err error) {
+		assert.ErrorContains(t, err, "field NonExistentField not found")
+		wg.Done()
+	}, []*TestModel{initialModels[0]}, []string{"MyValue", "NonExistentField"})
+	wg.Wait()
 }
 
 func TestConcurrentOperations(t *testing.T) {
@@ -445,10 +604,12 @@ func TestSelectBatcher(t *testing.T) {
 
 	t.Run("TestModel", func(t *testing.T) {
 		runTestModelTests(t, ctx)
+		runTestModelAsyncTests(t, ctx)
 	})
 
 	t.Run("CompositeKeyModel", func(t *testing.T) {
 		runCompositeKeyModelTests(t, ctx)
+		runCompositeKeyModelAsyncTests(t, ctx)
 	})
 }
 
@@ -585,5 +746,113 @@ func runConcurrentTests[T any](t *testing.T, selectBatcher *SelectBatcher[T]) {
 			assert.NoError(t, errors[i])
 			assert.NotNil(t, results[i])
 		}
+	})
+}
+
+func runTestModelAsyncTests(t *testing.T, ctx context.Context) {
+	selectBatcher, err := NewSelectBatcher[TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx, []string{"id", "name", "my_value"})
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert some test data
+	testModels := []TestModel{
+		{Name: "Test 1", MyValue: 10},
+		{Name: "Test 2", MyValue: 20},
+		{Name: "Test 3", MyValue: 30},
+		{Name: "Test 4", MyValue: 40},
+		{Name: "Test 5", MyValue: 50},
+	}
+	result := db.Create(&testModels)
+	assert.NoError(t, result.Error)
+	assert.Equal(t, int64(5), result.RowsAffected)
+
+	// Run async tests
+	runAsyncTests(t, selectBatcher,
+		func(m TestModel) string { return m.Name },
+		func(m TestModel) int { return m.MyValue },
+	)
+}
+
+func runCompositeKeyModelAsyncTests(t *testing.T, ctx context.Context) {
+	selectBatcher, err := NewSelectBatcher[CompositeKeyModel](getDBProvider(), 3, 100*time.Millisecond, ctx, []string{"id1", "id2", "name", "my_value"})
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM composite_key_models")
+
+	// Insert some test data
+	testModels := []CompositeKeyModel{
+		{ID1: 1, ID2: "A", Name: "Test 1", MyValue: 10},
+		{ID1: 1, ID2: "B", Name: "Test 2", MyValue: 20},
+		{ID1: 2, ID2: "A", Name: "Test 3", MyValue: 30},
+		{ID2: "B", Name: "Test 4", MyValue: 40},
+		{ID1: 3, ID2: "A", Name: "Test 5", MyValue: 50},
+	}
+	result := db.Create(&testModels)
+	assert.NoError(t, result.Error)
+	assert.Equal(t, int64(5), result.RowsAffected)
+
+	// Run async tests
+	runAsyncTests(t, selectBatcher,
+		func(m CompositeKeyModel) string { return m.Name },
+		func(m CompositeKeyModel) int { return m.MyValue },
+	)
+}
+
+func runAsyncTests[T any](t *testing.T, selectBatcher *SelectBatcher[T], getNameFunc func(T) string, getMyValueFunc func(T) int) {
+	// Test single result async
+	t.Run("SingleResultAsync", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		selectBatcher.SelectAsync(func(results []T, err error) {
+			assert.NoError(t, err)
+			assert.Len(t, results, 1, "Expected 1 result, got %d", len(results))
+			if len(results) > 0 {
+				assert.Equal(t, "Test 1", getNameFunc(results[0]))
+				assert.Equal(t, 10, getMyValueFunc(results[0]))
+			}
+			wg.Done()
+		}, "name = ?", "Test 1")
+		wg.Wait()
+	})
+
+	// Test multiple results async
+	t.Run("MultipleResultsAsync", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		selectBatcher.SelectAsync(func(results []T, err error) {
+			assert.NoError(t, err)
+			assert.Len(t, results, 3, "Expected 3 results, got %d", len(results))
+			for _, result := range results {
+				assert.True(t, getMyValueFunc(result) > 25, "Expected MyValue > 25, got %d", getMyValueFunc(result))
+			}
+			wg.Done()
+		}, "my_value > ?", 25)
+		wg.Wait()
+	})
+
+	// Test no results async
+	t.Run("NoResultsAsync", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		selectBatcher.SelectAsync(func(results []T, err error) {
+			assert.NoError(t, err)
+			assert.Len(t, results, 0, "Expected 0 results, got %d", len(results))
+			wg.Done()
+		}, "name = ?", "Nonexistent")
+		wg.Wait()
+	})
+
+	// Test error handling async
+	t.Run("ErrorHandlingAsync", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		selectBatcher.SelectAsync(func(results []T, err error) {
+			assert.Error(t, err)
+			wg.Done()
+		}, "invalid_column = ?", "value")
+		wg.Wait()
 	})
 }
