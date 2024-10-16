@@ -5,7 +5,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"unicode"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -15,14 +14,19 @@ type PrometheusMetricsCollector struct {
 	misses     *prometheus.CounterVec
 	evictions  *prometheus.CounterVec
 	totalItems *prometheus.GaugeVec
-	customName string
+	funcLabel  string // User-defined function name label
+	pkgLabel   string // User-defined package name label
 	setupOnce  sync.Once
 }
 
-func NewPrometheusMetricsCollector(customName ...string) *PrometheusMetricsCollector {
+// NewPrometheusMetricsCollector initializes a collector with optional custom labels for function and package.
+func NewPrometheusMetricsCollector(labels ...string) *PrometheusMetricsCollector {
 	collector := &PrometheusMetricsCollector{}
-	if len(customName) > 0 {
-		collector.customName = customName[0]
+	if len(labels) > 0 {
+		collector.funcLabel = labels[0] // Custom function label
+		if len(labels) > 1 {
+			collector.pkgLabel = labels[1] // Custom package label
+		}
 	}
 	return collector
 }
@@ -30,40 +34,53 @@ func NewPrometheusMetricsCollector(customName ...string) *PrometheusMetricsColle
 func (p *PrometheusMetricsCollector) Setup(function interface{}) {
 	p.setupOnce.Do(func() {
 		pkgName, funcName := getFunctionName(function)
-		metricName := p.getMetricName(pkgName, funcName)
+		if p.funcLabel == "" {
+			p.funcLabel = funcName // Use actual function name if no custom label is provided
+		}
+		if p.pkgLabel == "" {
+			p.pkgLabel = pkgName // Use actual package name if no custom label is provided
+		}
 
+		// Metric names are constant, independent of function or package name
 		p.hits = p.safeNewCounterVec(
 			prometheus.CounterOpts{
-				Name: metricName + "_memoize_hits_total",
+				Name: "memoize_hits_total",
 				Help: "The total number of cache hits for the memoized function",
 			},
-			[]string{"function"},
+			[]string{"package", "function"},
 		)
 
 		p.misses = p.safeNewCounterVec(
 			prometheus.CounterOpts{
-				Name: metricName + "_memoize_misses_total",
+				Name: "memoize_misses_total",
 				Help: "The total number of cache misses for the memoized function",
 			},
-			[]string{"function"},
+			[]string{"package", "function"},
 		)
 
 		p.evictions = p.safeNewCounterVec(
 			prometheus.CounterOpts{
-				Name: metricName + "_memoize_evictions_total",
+				Name: "memoize_evictions_total",
 				Help: "The total number of cache evictions for the memoized function",
 			},
-			[]string{"function"},
+			[]string{"package", "function"},
 		)
 
 		p.totalItems = p.safeNewGaugeVec(
 			prometheus.GaugeOpts{
-				Name: metricName + "_memoize_total_items",
+				Name: "memoize_total_items",
 				Help: "The current number of items in the cache for the memoized function",
 			},
-			[]string{"function"},
+			[]string{"package", "function"},
 		)
 	})
+}
+
+func (p *PrometheusMetricsCollector) Collect(metrics *MemoMetrics) {
+	p.hits.WithLabelValues(p.pkgLabel, p.funcLabel).Add(float64(metrics.Hits.Swap(0)))
+	p.misses.WithLabelValues(p.pkgLabel, p.funcLabel).Add(float64(metrics.Misses.Swap(0)))
+	p.evictions.WithLabelValues(p.pkgLabel, p.funcLabel).Add(float64(metrics.Evictions.Swap(0)))
+	p.totalItems.WithLabelValues(p.pkgLabel, p.funcLabel).Set(float64(metrics.TotalItems))
 }
 
 func (p *PrometheusMetricsCollector) safeNewCounterVec(opts prometheus.CounterOpts, labelNames []string) *prometheus.CounterVec {
@@ -88,20 +105,6 @@ func (p *PrometheusMetricsCollector) safeNewGaugeVec(opts prometheus.GaugeOpts, 
 	return gv
 }
 
-func (p *PrometheusMetricsCollector) Collect(metrics *MemoMetrics) {
-	p.hits.WithLabelValues("").Add(float64(metrics.Hits.Swap(0)))
-	p.misses.WithLabelValues("").Add(float64(metrics.Misses.Swap(0)))
-	p.evictions.WithLabelValues("").Add(float64(metrics.Evictions.Swap(0)))
-	p.totalItems.WithLabelValues("").Set(float64(metrics.TotalItems))
-}
-
-func (p *PrometheusMetricsCollector) getMetricName(pkgName, funcName string) string {
-	if p.customName != "" {
-		return sanitizeMetricName(p.customName)
-	}
-	return sanitizeMetricName(pkgName + "_" + funcName)
-}
-
 func getFunctionName(i interface{}) (string, string) {
 	fullName := runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
 	lastSlash := strings.LastIndexByte(fullName, '/')
@@ -115,13 +118,4 @@ func getFunctionName(i interface{}) (string, string) {
 	pkgName := fullName[:lastSlash+lastDot]
 	funcName := fullName[lastSlash+lastDot+1:]
 	return pkgName, funcName
-}
-
-func sanitizeMetricName(name string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
-			return r
-		}
-		return '_'
-	}, name)
 }
