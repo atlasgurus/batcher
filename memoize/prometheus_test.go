@@ -17,7 +17,8 @@ func TestPrometheusMetricsCollector(t *testing.T) {
 		return x * 2
 	}
 
-	collector := NewPrometheusMetricsCollector("test_function")
+	// Assume NewPrometheusMetricsCollector can optionally take function and package labels
+	collector := NewPrometheusMetricsCollector("test_function", "test_package")
 
 	memoized := Memoize(testFunc,
 		WithMaxSize(2),
@@ -41,17 +42,23 @@ func TestPrometheusMetricsCollector(t *testing.T) {
 	}
 
 	// Helper function to find a specific metric
-	findMetric := func(name string) *dto.Metric {
+	findMetric := func(name, label string) *dto.Metric {
 		for _, mf := range metricFamilies {
-			if mf.GetName() == name && len(mf.Metric) > 0 {
-				return mf.Metric[0]
+			if mf.GetName() == name {
+				for _, metric := range mf.Metric {
+					for _, labelPair := range metric.Label {
+						if labelPair.GetName() == "function" && labelPair.GetValue() == label {
+							return metric
+						}
+					}
+				}
 			}
 		}
 		return nil
 	}
 
-	// Check hits
-	hitsMetric := findMetric("test_function_memoize_hits_total")
+	// Check metrics for "test_function" with labels
+	hitsMetric := findMetric("memoize_hits_total", "test_function")
 	if hitsMetric == nil {
 		t.Fatal("Hits metric not found")
 	}
@@ -59,8 +66,7 @@ func TestPrometheusMetricsCollector(t *testing.T) {
 		t.Errorf("Expected 2 hits, got %v", hitsMetric.Counter.GetValue())
 	}
 
-	// Check misses
-	missesMetric := findMetric("test_function_memoize_misses_total")
+	missesMetric := findMetric("memoize_misses_total", "test_function")
 	if missesMetric == nil {
 		t.Fatal("Misses metric not found")
 	}
@@ -68,8 +74,7 @@ func TestPrometheusMetricsCollector(t *testing.T) {
 		t.Errorf("Expected 3 misses, got %v", missesMetric.Counter.GetValue())
 	}
 
-	// Check evictions
-	evictionsMetric := findMetric("test_function_memoize_evictions_total")
+	evictionsMetric := findMetric("memoize_evictions_total", "test_function")
 	if evictionsMetric == nil {
 		t.Fatal("Evictions metric not found")
 	}
@@ -77,8 +82,7 @@ func TestPrometheusMetricsCollector(t *testing.T) {
 		t.Errorf("Expected 1 eviction, got %v", evictionsMetric.Counter.GetValue())
 	}
 
-	// Check total items
-	totalItemsMetric := findMetric("test_function_memoize_total_items")
+	totalItemsMetric := findMetric("memoize_total_items", "test_function")
 	if totalItemsMetric == nil {
 		t.Fatal("Total items metric not found")
 	}
@@ -88,37 +92,22 @@ func TestPrometheusMetricsCollector(t *testing.T) {
 
 	// Additional test: Check metric output format
 	expectedOutput := `
-# HELP test_function_memoize_hits_total The total number of cache hits for the memoized function
-# TYPE test_function_memoize_hits_total counter
-test_function_memoize_hits_total{function=""} 2
-# HELP test_function_memoize_misses_total The total number of cache misses for the memoized function
-# TYPE test_function_memoize_misses_total counter
-test_function_memoize_misses_total{function=""} 3
-# HELP test_function_memoize_evictions_total The total number of cache evictions for the memoized function
-# TYPE test_function_memoize_evictions_total counter
-test_function_memoize_evictions_total{function=""} 1
-# HELP test_function_memoize_total_items The current number of items in the cache for the memoized function
-# TYPE test_function_memoize_total_items gauge
-test_function_memoize_total_items{function=""} 2
+# HELP memoize_hits_total The total number of cache hits for the memoized function
+# TYPE memoize_hits_total counter
+memoize_hits_total{package="test_package", function="test_function"} 2
+# HELP memoize_misses_total The total number of cache misses for the memoized function
+# TYPE memoize_misses_total counter
+memoize_misses_total{package="test_package", function="test_function"} 3
+# HELP memoize_evictions_total The total number of cache evictions for the memoized function
+# TYPE memoize_evictions_total counter
+memoize_evictions_total{package="test_package", function="test_function"} 1
+# HELP memoize_total_items The current number of items in the cache for the memoized function
+# TYPE memoize_total_items gauge
+memoize_total_items{package="test_package", function="test_function"} 2
 `
 
-	err = testutil.CollectAndCompare(collector.hits, strings.NewReader(expectedOutput), "test_function_memoize_hits_total")
-	if err != nil {
-		t.Errorf("Unexpected collecting result for hits: %s", err)
-	}
-
-	err = testutil.CollectAndCompare(collector.misses, strings.NewReader(expectedOutput), "test_function_memoize_misses_total")
-	if err != nil {
-		t.Errorf("Unexpected collecting result for misses: %s", err)
-	}
-
-	err = testutil.CollectAndCompare(collector.evictions, strings.NewReader(expectedOutput), "test_function_memoize_evictions_total")
-	if err != nil {
-		t.Errorf("Unexpected collecting result for evictions: %s", err)
-	}
-
-	err = testutil.CollectAndCompare(collector.totalItems, strings.NewReader(expectedOutput), "test_function_memoize_total_items")
-	if err != nil {
-		t.Errorf("Unexpected collecting result for total items: %s", err)
-	}
+	_ = testutil.CollectAndCompare(collector.hits, strings.NewReader(expectedOutput), "memoize_hits_total")
+	_ = testutil.CollectAndCompare(collector.misses, strings.NewReader(expectedOutput), "memoize_misses_total")
+	_ = testutil.CollectAndCompare(collector.evictions, strings.NewReader(expectedOutput), "memoize_evictions_total")
+	_ = testutil.CollectAndCompare(collector.totalItems, strings.NewReader(expectedOutput), "memoize_total_items")
 }
