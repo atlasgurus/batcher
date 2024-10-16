@@ -23,9 +23,10 @@ type cacheEntry struct {
 type Option func(*memoizeOptions)
 
 type memoizeOptions struct {
-	maxSize    int
-	expiration time.Duration
-	metrics    MetricsCollector
+	maxSize      int
+	expiration   time.Duration
+	metrics      MetricsCollector
+	ignoreParams []int
 }
 
 func WithMaxSize(size int) Option {
@@ -37,6 +38,12 @@ func WithMaxSize(size int) Option {
 func WithExpiration(d time.Duration) Option {
 	return func(o *memoizeOptions) {
 		o.expiration = d
+	}
+}
+
+func WithIgnoreParams(indices []int) Option {
+	return func(o *memoizeOptions) {
+		o.ignoreParams = indices
 	}
 }
 
@@ -102,7 +109,7 @@ func Memoize[F any](f F, options ...Option) F {
 			}
 		}()
 
-		key := makeKey(args)
+		key := makeKey(args, opts.ignoreParams)
 
 		mutex.Lock()
 		element, found := cache[key]
@@ -128,7 +135,7 @@ func Memoize[F any](f F, options ...Option) F {
 			key:       key,
 			ready:     make(chan struct{}),
 			computing: true,
-			expireAt:  now.Add(opts.expiration), // Set the expiration time when creating the entry
+			expireAt:  now.Add(opts.expiration),
 		}
 		element = lru.PushFront(entry)
 		cache[key] = element
@@ -151,16 +158,18 @@ func Memoize[F any](f F, options ...Option) F {
 	return wrapped.Interface().(F)
 }
 
-func makeKey(args []reflect.Value) string {
+func makeKey(args []reflect.Value, ignoreParams []int) string {
 	var key strings.Builder
 	for i, arg := range args {
-		if i > 0 {
-			key.WriteString(",")
-		}
-		if true {
-			key.WriteString(makeShallowKey(arg))
-		} else {
-			key.WriteString(makeDeepKey(arg))
+		if !contains(ignoreParams, i) {
+			if key.Len() > 0 {
+				key.WriteString(",")
+			}
+			if true {
+				key.WriteString(makeShallowKey(arg))
+			} else {
+				key.WriteString(makeDeepKey(arg))
+			}
 		}
 	}
 	return key.String()
@@ -185,7 +194,6 @@ func makeShallowKey(v reflect.Value) string {
 	if v.Type().Implements(reflect.TypeOf((*context.Context)(nil)).Elem()) {
 		return "context" // We return a constant string for all contexts
 	}
-
 	switch v.Kind() {
 	case reflect.Ptr:
 		if v.IsNil() {
@@ -214,4 +222,13 @@ func makeShallowKey(v reflect.Value) string {
 	default:
 		return fmt.Sprintf("%v", v.Interface())
 	}
+}
+
+func contains(slice []int, item int) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }

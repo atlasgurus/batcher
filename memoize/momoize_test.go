@@ -448,7 +448,7 @@ type MockMetricsCollector struct {
 	collectCalls int
 }
 
-func (m *MockMetricsCollector) Setup(function interface{}) {
+func (m *MockMetricsCollector) Setup(_ interface{}) {
 	m.setupCalled = true
 }
 
@@ -517,4 +517,63 @@ func TestMemoizeWithMetrics(t *testing.T) {
 
 	// Log the total items for informational purposes
 	t.Logf("Total items after test: %d", mockCollector.metrics.TotalItems)
+}
+
+func TestMemoizeWithIgnoreParams(t *testing.T) {
+	calls := 0
+	f := func(a, b, c int) int {
+		calls++
+		return a + b + c
+	}
+
+	memoized := Memoize(f, WithIgnoreParams([]int{1})) // Ignore the second parameter (index 1)
+
+	testCases := []struct {
+		name           string
+		a, b, c        int
+		expectedResult int
+		expectedCalls  int
+	}{
+		{"First call", 1, 2, 3, 6, 1},
+		{"Same a and c, different b", 1, 5, 3, 6, 1},     // Should hit cache despite different b
+		{"Different a", 2, 2, 3, 7, 2},                   // Should miss cache and return new result
+		{"Different c", 1, 2, 4, 7, 3},                   // Should miss cache
+		{"Original values, different b", 1, 10, 3, 6, 3}, // Should hit cache
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := memoized(tc.a, tc.b, tc.c)
+			if result != tc.expectedResult {
+				t.Errorf("Expected result %d, got %d", tc.expectedResult, result)
+			}
+			if calls != tc.expectedCalls {
+				t.Errorf("Expected %d calls, got %d", tc.expectedCalls, calls)
+			}
+		})
+	}
+
+	// Test with multiple ignored parameters
+	multiIgnoreMemoized := Memoize(f, WithIgnoreParams([]int{1, 2})) // Ignore b and c
+	result1 := multiIgnoreMemoized(1, 2, 3)
+	result2 := multiIgnoreMemoized(1, 5, 6)
+
+	if result1 != result2 {
+		t.Errorf("Multi-ignore: Expected equal results, got %d and %d", result1, result2)
+	}
+	if calls != 4 { // 3 from previous tests + 1 for this new call
+		t.Errorf("Multi-ignore: Expected 4 calls, got %d", calls)
+	}
+
+	// Test with all parameters ignored
+	allIgnoreMemoized := Memoize(f, WithIgnoreParams([]int{0, 1, 2}))
+	allIgnoreResult1 := allIgnoreMemoized(1, 2, 3)
+	allIgnoreResult2 := allIgnoreMemoized(4, 5, 6)
+
+	if allIgnoreResult1 != allIgnoreResult2 {
+		t.Errorf("All-ignore: Expected equal results, got %d and %d", allIgnoreResult1, allIgnoreResult2)
+	}
+	if calls != 5 { // 4 from previous tests + 1 for this new call
+		t.Errorf("All-ignore: Expected 5 calls, got %d", calls)
+	}
 }
