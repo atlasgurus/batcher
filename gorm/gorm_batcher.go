@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/atlasgurus/batcher/batcher"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -46,18 +47,18 @@ func NewInsertBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 
 // NewUpdateBatcher creates a new GORM update batcher
 func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) (*UpdateBatcher[T], error) {
-	// Create a temporary DB connection to get the table name
-	db, err := dbProvider()
+	// Create a temporary in-memory SQLite database
+	tempDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get database connection: %w", err)
+		return nil, fmt.Errorf("failed to create temporary database: %w", err)
 	}
 
 	// Use a new instance of T to get the table name
 	var model T
-	stmt := &gorm.Statement{DB: db}
+	stmt := &gorm.Statement{DB: tempDB}
 	err = stmt.Parse(&model)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse model for table name: %w", err)
+		return nil, fmt.Errorf("failed to parse model: %w", err)
 	}
 
 	primaryKeyField, primaryKeyName, keyErr := getPrimaryKeyInfo(reflect.TypeOf(model))
@@ -438,13 +439,14 @@ type SelectItem[T any] struct {
 }
 
 func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context, columns []string) (*SelectBatcher[T], error) {
-	db, err := dbProvider()
+	// Create a temporary in-memory SQLite database
+	tempDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get database connection: %w", err)
+		return nil, fmt.Errorf("failed to create temporary database: %w", err)
 	}
 
 	var model T
-	stmt := &gorm.Statement{DB: db}
+	stmt := &gorm.Statement{DB: tempDB}
 	err = stmt.Parse(&model)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse model for table name: %w", err)
