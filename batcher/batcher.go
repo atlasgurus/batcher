@@ -13,13 +13,14 @@ type BatchProcessorInterface[T any] interface {
 
 // BatchProcessor is a generic batch processor
 type BatchProcessor[T any] struct {
-	input        chan batchItem[T]
-	maxBatchSize int
-	maxWaitTime  time.Duration
-	processFn    func([]T) []error
-	ctx          context.Context
+	input           chan batchItem[T]
+	maxBatchSize    int
+	maxWaitTime     time.Duration
+	processFn       func([]T) []error
+	ctx             context.Context
+	metrics         *BatchMetrics
+	metricsCallback func(BatchMetrics)
 }
-
 type batchItem[T any] struct {
 	item T
 	resp chan error
@@ -32,12 +33,51 @@ func NewBatchProcessor[T any](
 	ctx context.Context,
 	processFn func([]T) []error,
 ) BatchProcessorInterface[T] {
+	return NewBatchProcessorWithOptions(
+		ctx,
+		processFn,
+		WithMaxBatchSize[T](maxBatchSize),
+		WithMaxWaitTime[T](maxWaitTime),
+	)
+}
+
+type BatchProcessorOption[T any] func(*BatchProcessor[T])
+
+func WithMaxBatchSize[T any](size int) BatchProcessorOption[T] {
+	return func(bp *BatchProcessor[T]) {
+		bp.maxBatchSize = size
+	}
+}
+
+func WithMaxWaitTime[T any](duration time.Duration) BatchProcessorOption[T] {
+	return func(bp *BatchProcessor[T]) {
+		bp.maxWaitTime = duration
+	}
+}
+
+func WithMetricsCallback[T any](callback func(BatchMetrics)) BatchProcessorOption[T] {
+	return func(bp *BatchProcessor[T]) {
+		bp.metricsCallback = callback
+	}
+}
+
+func NewBatchProcessorWithOptions[T any](
+	ctx context.Context,
+	processFn func([]T) []error,
+	options ...BatchProcessorOption[T],
+) BatchProcessorInterface[T] {
 	bp := &BatchProcessor[T]{
-		input:        make(chan batchItem[T]),
-		maxBatchSize: maxBatchSize,
-		maxWaitTime:  maxWaitTime,
-		processFn:    processFn,
-		ctx:          ctx,
+		input:           make(chan batchItem[T]),
+		maxBatchSize:    100,         // Default max batch size
+		maxWaitTime:     time.Second, // Default max wait time
+		processFn:       processFn,
+		ctx:             ctx,
+		metrics:         &BatchMetrics{},
+		metricsCallback: func(BatchMetrics) {}, // Default no-op callback
+	}
+
+	for _, option := range options {
+		option(bp)
 	}
 
 	go bp.run()
@@ -126,4 +166,11 @@ func RepeatErr(n int, err error) []error {
 		result[i] = err
 	}
 	return result
+}
+
+type BatchMetrics struct {
+	BatchesProcessed    int64
+	ItemsProcessed      int64
+	TotalProcessingTime time.Duration
+	Errors              int64
 }
