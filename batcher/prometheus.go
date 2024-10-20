@@ -14,14 +14,12 @@ type PrometheusMetricsCollector struct {
 }
 
 func NewPrometheusMetricsCollector(processorName string) *PrometheusMetricsCollector {
-	collector := &PrometheusMetricsCollector{
+	return &PrometheusMetricsCollector{
 		processorName: processorName,
 	}
-	collector.setup()
-	return collector
 }
 
-func (p *PrometheusMetricsCollector) setup() {
+func (p *PrometheusMetricsCollector) Setup(batcher *BatchProcessor[any]) {
 	p.batchesProcessed = metrics.SafeNewCounterVec(
 		prometheus.CounterOpts{
 			Name: "batcher_batches_processed_total",

@@ -12,15 +12,21 @@ type BatchProcessorInterface[T any] interface {
 }
 
 // BatchProcessor is a generic batch processor
-type BatchProcessor[T any] struct {
-	input           chan batchItem[T]
-	maxBatchSize    int
-	maxWaitTime     time.Duration
-	processFn       func([]T) []error
-	ctx             context.Context
-	metrics         *BatchMetrics
-	metricsCallback func(BatchMetrics)
+type MetricsCollector interface {
+	Setup(batcher *BatchProcessor[any])
+	Collect(metrics BatchMetrics)
 }
+
+type BatchProcessor[T any] struct {
+	input            chan batchItem[T]
+	maxBatchSize     int
+	maxWaitTime      time.Duration
+	processFn        func([]T) []error
+	ctx              context.Context
+	metrics          *BatchMetrics
+	metricsCollector MetricsCollector
+}
+
 type batchItem[T any] struct {
 	item T
 	resp chan error
@@ -55,25 +61,19 @@ func WithMaxWaitTime[T any](duration time.Duration) BatchProcessorOption[T] {
 	}
 }
 
-func WithMetricsCallback[T any](callback func(BatchMetrics)) BatchProcessorOption[T] {
-	return func(bp *BatchProcessor[T]) {
-		bp.metricsCallback = callback
-	}
-}
-
 func NewBatchProcessorWithOptions[T any](
 	ctx context.Context,
 	processFn func([]T) []error,
 	options ...BatchProcessorOption[T],
 ) BatchProcessorInterface[T] {
 	bp := &BatchProcessor[T]{
-		input:           make(chan batchItem[T]),
-		maxBatchSize:    100,         // Default max batch size
-		maxWaitTime:     time.Second, // Default max wait time
-		processFn:       processFn,
-		ctx:             ctx,
-		metrics:         &BatchMetrics{},
-		metricsCallback: func(BatchMetrics) {}, // Default no-op callback
+		input:            make(chan batchItem[T]),
+		maxBatchSize:     100,         // Default max batch size
+		maxWaitTime:      time.Second, // Default max wait time
+		processFn:        processFn,
+		ctx:              ctx,
+		metrics:          &BatchMetrics{},
+		metricsCollector: nil, // Initialize with nil
 	}
 
 	for _, option := range options {
@@ -173,4 +173,10 @@ type BatchMetrics struct {
 	ItemsProcessed      int64
 	TotalProcessingTime time.Duration
 	Errors              int64
+}
+
+func WithMetrics[T any](collector MetricsCollector) BatchProcessorOption[T] {
+	return func(bp *BatchProcessor[T]) {
+		bp.metricsCollector = collector
+	}
 }
