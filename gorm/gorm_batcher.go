@@ -2,6 +2,7 @@ package gorm
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -156,32 +157,19 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
-		var lastErr error
-		for attempt := 0; attempt < maxRetries; attempt++ {
-			err = db.Transaction(func(tx *gorm.DB) error {
+		err = retryWithDeadlockDetection(maxRetries, func() error {
+			return db.Transaction(func(tx *gorm.DB) error {
 				return tx.Clauses(clause.OnConflict{
 					UpdateAll: true,
 				}).CreateInBatches(allRecords, len(allRecords)).Error
 			})
+		})
 
-			if err == nil {
-				return batcher.RepeatErr(len(batches), nil)
-			}
-
-			if !isDeadlockError(err) {
-				lastErr = fmt.Errorf("failed to upsert records: %w", err)
-				break
-			}
-
-			delay := baseDelay * time.Duration(1<<uint(attempt)) * time.Duration(1+rand.Intn(100)) / 100
-			time.Sleep(delay)
+		if err != nil {
+			return batcher.RepeatErr(len(batches), err)
 		}
 
-		if lastErr != nil {
-			return batcher.RepeatErr(len(batches), lastErr)
-		}
-
-		return batcher.RepeatErr(len(batches), fmt.Errorf("failed to upsert records after %d retries", maxRetries))
+		return batcher.RepeatErr(len(batches), nil)
 	}
 }
 
@@ -195,9 +183,9 @@ func batchUpdate[T any](
 			return nil
 		}
 
-		db, dbProviderErr := dbProvider()
-		if dbProviderErr != nil {
-			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", dbProviderErr))
+		db, err := dbProvider()
+		if err != nil {
+			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
 		}
 
 		var allUpdateItems []UpdateItem[T]
@@ -209,9 +197,8 @@ func batchUpdate[T any](
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
-		var lastErr error
-		for attempt := 0; attempt < maxRetries; attempt++ {
-			err := db.Transaction(func(tx *gorm.DB) error {
+		err = retryWithDeadlockDetection(maxRetries, func() error {
+			return db.Transaction(func(tx *gorm.DB) error {
 				mapping, err := createFieldMapping(allUpdateItems[0].Item)
 				if err != nil {
 					return err
@@ -315,28 +302,15 @@ func batchUpdate[T any](
 
 				return tx.Exec(queryBuilder.String(), allValues...).Error
 			})
+		})
 
-			if err == nil {
-				return batcher.RepeatErr(len(batches), nil)
-			}
-
-			if !isDeadlockError(err) {
-				lastErr = fmt.Errorf("failed to update records: %w", err)
-				break
-			}
-
-			delay := baseDelay * time.Duration(1<<uint(attempt)) * time.Duration(1+rand.Intn(100)) / 100
-			time.Sleep(delay)
+		if err != nil {
+			return batcher.RepeatErr(len(batches), err)
 		}
 
-		if lastErr != nil {
-			return batcher.RepeatErr(len(batches), lastErr)
-		}
-
-		return batcher.RepeatErr(len(batches), fmt.Errorf("failed to update records after %d retries", maxRetries))
+		return batcher.RepeatErr(len(batches), nil)
 	}
 }
-
 func isDeadlockError(err error) bool {
 	return strings.Contains(err.Error(), "Deadlock found when trying to get lock") ||
 		strings.Contains(err.Error(), "database table is locked")
@@ -551,13 +525,17 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
-		// Execute the query
-		rows, err := db.Raw(queryBuilder.String(), args...).Rows()
+		var rows *sql.Rows
+		err = retryWithDeadlockDetection(maxRetries, func() error {
+			var queryErr error
+			rows, queryErr = db.Raw(queryBuilder.String(), args...).Rows()
+			return queryErr
+		})
+
 		if err != nil {
 			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to execute select query: %w", err))
 		}
 		defer rows.Close()
-
 		// Prepare a slice of slices to hold all results
 		results := make([][]T, len(allItems))
 		for i := range results {
@@ -754,4 +732,24 @@ func scanIntoStruct(result interface{}, columns []string, values []interface{}) 
 		}
 	}
 	return nil
+}
+
+func retryWithDeadlockDetection(maxRetries int, operation func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err := operation()
+		if err == nil {
+			return nil
+		}
+
+		if !isDeadlockError(err) {
+			return fmt.Errorf("operation failed: %w", err)
+		}
+
+		delay := baseDelay * time.Duration(1<<uint(attempt)) * time.Duration(1+rand.Intn(100)) / 100
+		time.Sleep(delay)
+		lastErr = err
+	}
+
+	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr)
 }
