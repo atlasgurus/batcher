@@ -126,9 +126,27 @@ func (bp *BatchProcessor[T]) run() {
 		if len(batch) == 0 {
 			return
 		}
+		startTime := time.Now()
 		errs := bp.processFn(batch)
 		for i, ch := range respChans {
 			ch <- errs[i]
+		}
+
+		// Collect metrics after processing the batch
+		if bp.metricsCollector != nil {
+			errorCount := 0
+			for _, err := range errs {
+				if err != nil {
+					errorCount++
+				}
+			}
+
+			bp.metricsCollector.Collect(BatchMetrics{
+				BatchesProcessed:    1,
+				ItemsProcessed:      int64(len(batch)),
+				TotalProcessingTime: time.Since(startTime),
+				Errors:              int64(errorCount),
+			})
 		}
 		batch = nil
 		respChans = nil
@@ -159,7 +177,6 @@ func (bp *BatchProcessor[T]) run() {
 		}
 	}
 }
-
 func RepeatErr(n int, err error) []error {
 	result := make([]error, n)
 	for i := 0; i < n; i++ {
