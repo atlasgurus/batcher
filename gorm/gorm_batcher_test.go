@@ -856,3 +856,67 @@ func runAsyncTests[T any](t *testing.T, selectBatcher *SelectBatcher[T], getName
 		wg.Wait()
 	})
 }
+
+type RelatedModel struct {
+	ID       uint `gorm:"primaryKey"`
+	Name     string
+	ParentID uint
+}
+
+type ParentModel struct {
+	ID          uint   `gorm:"primaryKey"`
+	Name        string `gorm:"type:varchar(100)"`
+	MyValue     int
+	RelatedData []RelatedModel // Intentionally without foreign key constraint
+}
+
+func TestUpdateBatcherWithRelationships(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create tables
+	err := db.AutoMigrate(&ParentModel{}, &RelatedModel{})
+	assert.NoError(t, err)
+
+	// Clean up tables
+	db.Exec("DELETE FROM related_models")
+	db.Exec("DELETE FROM parent_models")
+
+	// Insert test data
+	parent := &ParentModel{
+		Name:    "Test Parent",
+		MyValue: 10,
+	}
+	result := db.Create(parent)
+	assert.NoError(t, result.Error)
+
+	// Create some related data
+	related := []RelatedModel{
+		{Name: "Related 1", ParentID: parent.ID},
+		{Name: "Related 2", ParentID: parent.ID},
+	}
+	result = db.Create(&related)
+	assert.NoError(t, result.Error)
+
+	// Load the parent with its related data
+	var loadedParent ParentModel
+	err = db.Preload("RelatedData").First(&loadedParent, parent.ID).Error
+	assert.NoError(t, err)
+	assert.Equal(t, 2, len(loadedParent.RelatedData))
+
+	// Create batcher and attempt update
+	batcher, err := NewUpdateBatcher[*ParentModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err, "Should be able to create batcher even with relationship fields")
+
+	// Modify and update
+	loadedParent.MyValue = 20
+	err = batcher.Update([]*ParentModel{&loadedParent}, []string{"MyValue"})
+	assert.NoError(t, err, "Should be able to update model with relationship fields")
+
+	// Verify the update
+	var verifyParent ParentModel
+	err = db.Preload("RelatedData").First(&verifyParent, parent.ID).Error
+	assert.NoError(t, err)
+	assert.Equal(t, 20, verifyParent.MyValue, "MyValue should be updated")
+	assert.Equal(t, 2, len(verifyParent.RelatedData), "Related data should still be intact")
+}
