@@ -77,7 +77,6 @@ func TestMain(m *testing.M) {
 	// Run the tests
 	code := m.Run()
 
-	// Clean up
 	v1DB.Close()
 
 	os.Exit(code)
