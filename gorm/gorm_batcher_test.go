@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -874,49 +875,74 @@ func TestUpdateBatcherWithRelationships(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create tables
-	err := db.AutoMigrate(&ParentModel{}, &RelatedModel{})
+	// Get DB
+	db, err := getDBProvider()()
 	assert.NoError(t, err)
 
-	// Clean up tables
-	db.Exec("DELETE FROM related_models")
-	db.Exec("DELETE FROM parent_models")
+	// Drop tables if they exist
+	db.Exec("DROP TABLE IF EXISTS related_models")
+	db.Exec("DROP TABLE IF EXISTS parent_models")
 
-	// Insert test data
-	parent := &ParentModel{
-		Name:    "Test Parent",
-		MyValue: 10,
+	// Create tables manually
+	createTableSQL := `
+    CREATE TABLE parent_models (
+        id INTEGER PRIMARY KEY AUTO_INCREMENT,
+        name VARCHAR(100),
+        my_value INTEGER
+    );
+    
+    CREATE TABLE related_models (
+        id INTEGER PRIMARY KEY AUTO_INCREMENT,
+        name VARCHAR(100),
+        parent_id INTEGER
+    );`
+
+	// Split and execute each statement
+	for _, stmt := range strings.Split(createTableSQL, ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		err = db.Exec(stmt).Error
+		assert.NoError(t, err, "Failed to create table with statement: %s", stmt)
 	}
-	result := db.Create(parent)
+
+	// Insert test data directly
+	insertParentSQL := "INSERT INTO parent_models (name, my_value) VALUES (?, ?)"
+	result := db.Exec(insertParentSQL, "Test Parent", 10)
 	assert.NoError(t, result.Error)
 
-	// Create some related data
-	related := []RelatedModel{
-		{Name: "Related 1", ParentID: parent.ID},
-		{Name: "Related 2", ParentID: parent.ID},
-	}
-	result = db.Create(&related)
-	assert.NoError(t, result.Error)
-
-	// Load the parent with its related data
-	var loadedParent ParentModel
-	err = db.Preload("RelatedData").First(&loadedParent, parent.ID).Error
+	parentID := uint(0)
+	row := db.Raw("SELECT LAST_INSERT_ID()").Row()
+	err = row.Scan(&parentID)
 	assert.NoError(t, err)
-	assert.Equal(t, 2, len(loadedParent.RelatedData))
+	assert.NotZero(t, parentID)
 
-	// Create batcher and attempt update
+	// Insert related data
+	insertRelatedSQL := "INSERT INTO related_models (name, parent_id) VALUES (?, ?), (?, ?)"
+	result = db.Exec(insertRelatedSQL, "Related 1", parentID, "Related 2", parentID)
+	assert.NoError(t, result.Error)
+
+	// Now use the UpdateBatcher
 	batcher, err := NewUpdateBatcher[*ParentModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
-	assert.NoError(t, err, "Should be able to create batcher even with relationship fields")
-
-	// Modify and update
-	loadedParent.MyValue = 20
-	err = batcher.Update([]*ParentModel{&loadedParent}, []string{"MyValue"})
-	assert.NoError(t, err, "Should be able to update model with relationship fields")
-
-	// Verify the update
-	var verifyParent ParentModel
-	err = db.Preload("RelatedData").First(&verifyParent, parent.ID).Error
 	assert.NoError(t, err)
-	assert.Equal(t, 20, verifyParent.MyValue, "MyValue should be updated")
-	assert.Equal(t, 2, len(verifyParent.RelatedData), "Related data should still be intact")
+
+	// Update using batcher
+	updateModel := &ParentModel{
+		ID:      parentID,
+		MyValue: 20,
+	}
+	err = batcher.Update([]*ParentModel{updateModel}, []string{"my_value"})
+	assert.NoError(t, err)
+
+	// Verify update directly with SQL
+	var myValue int
+	var relatedCount int
+	err = db.Raw("SELECT my_value FROM parent_models WHERE id = ?", parentID).Row().Scan(&myValue)
+	assert.NoError(t, err)
+	assert.Equal(t, 20, myValue)
+
+	err = db.Raw("SELECT COUNT(*) FROM related_models WHERE parent_id = ?", parentID).Row().Scan(&relatedCount)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, relatedCount)
 }

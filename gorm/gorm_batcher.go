@@ -47,30 +47,40 @@ func NewInsertBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 }
 
 // NewUpdateBatcher creates a new GORM update batcher
-func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) (*UpdateBatcher[T], error) {
-	// Create a temporary in-memory SQLite database
-	tempDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary database: %w", err)
-	}
-
-	// Use a new instance of T to get the table name
+// Helper function to get table name from struct
+func getTableName[T any]() string {
 	var model T
-	stmt := &gorm.Statement{DB: tempDB}
-	err = stmt.Parse(&model)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse model: %w", err)
+	t := reflect.TypeOf(model)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
 	}
 
-	primaryKeyField, primaryKeyName, keyErr := getPrimaryKeyInfo(reflect.TypeOf(model))
+	// Check if the type implements TableName method
+	if tn, ok := reflect.New(t).Interface().(interface{ TableName() string }); ok {
+		return tn.TableName()
+	}
+
+	// Default to struct name converted to snake case plural
+	return toSnakeCase(t.Name()) + "s"
+}
+
+// NewUpdateBatcher creates a new GORM update batcher
+func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) (*UpdateBatcher[T], error) {
+	// Get table name directly from the type
+	tableName := getTableName[T]()
+
+	// Get primary key info directly using reflection
+	var model T
+	t := reflect.TypeOf(model)
+	primaryKeyField, primaryKeyName, keyErr := getPrimaryKeyInfo(t)
 	if keyErr != nil {
 		return nil, keyErr
 	}
 
 	return &UpdateBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchUpdate[T](dbProvider, stmt.Table, primaryKeyField, primaryKeyName)),
-		tableName:  stmt.Table,
+		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchUpdate[T](dbProvider, tableName, primaryKeyField, primaryKeyName)),
+		tableName:  tableName,
 	}, nil
 }
 
