@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -76,7 +77,6 @@ func TestMain(m *testing.M) {
 	// Run the tests
 	code := m.Run()
 
-	// Clean up
 	v1DB.Close()
 
 	os.Exit(code)
@@ -855,4 +855,93 @@ func runAsyncTests[T any](t *testing.T, selectBatcher *SelectBatcher[T], getName
 		}, "invalid_column = ?", "value")
 		wg.Wait()
 	})
+}
+
+type RelatedModel struct {
+	ID       uint `gorm:"primaryKey"`
+	Name     string
+	ParentID uint
+}
+
+type ParentModel struct {
+	ID          uint   `gorm:"primaryKey"`
+	Name        string `gorm:"type:varchar(100)"`
+	MyValue     int
+	RelatedData []RelatedModel // Intentionally without foreign key constraint
+}
+
+func TestUpdateBatcherWithRelationships(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Get DB
+	db, err := getDBProvider()()
+	assert.NoError(t, err)
+
+	// Drop tables if they exist
+	db.Exec("DROP TABLE IF EXISTS related_models")
+	db.Exec("DROP TABLE IF EXISTS parent_models")
+
+	// Create tables manually
+	createTableSQL := `
+    CREATE TABLE parent_models (
+        id INTEGER PRIMARY KEY AUTO_INCREMENT,
+        name VARCHAR(100),
+        my_value INTEGER
+    );
+    
+    CREATE TABLE related_models (
+        id INTEGER PRIMARY KEY AUTO_INCREMENT,
+        name VARCHAR(100),
+        parent_id INTEGER
+    );`
+
+	// Split and execute each statement
+	for _, stmt := range strings.Split(createTableSQL, ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		err = db.Exec(stmt).Error
+		assert.NoError(t, err, "Failed to create table with statement: %s", stmt)
+	}
+
+	// Insert test data directly
+	insertParentSQL := "INSERT INTO parent_models (name, my_value) VALUES (?, ?)"
+	result := db.Exec(insertParentSQL, "Test Parent", 10)
+	assert.NoError(t, result.Error)
+
+	parentID := uint(0)
+	row := db.Raw("SELECT LAST_INSERT_ID()").Row()
+	err = row.Scan(&parentID)
+	assert.NoError(t, err)
+	assert.NotZero(t, parentID)
+
+	// Insert related data
+	insertRelatedSQL := "INSERT INTO related_models (name, parent_id) VALUES (?, ?), (?, ?)"
+	result = db.Exec(insertRelatedSQL, "Related 1", parentID, "Related 2", parentID)
+	assert.NoError(t, result.Error)
+
+	// Now use the UpdateBatcher
+	batcher, err := NewUpdateBatcher[*ParentModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
+
+	// Update using batcher
+	updateModel := &ParentModel{
+		ID:      parentID,
+		MyValue: 20,
+	}
+	err = batcher.Update([]*ParentModel{updateModel}, []string{"my_value"})
+	assert.NoError(t, err)
+
+	// Verify update directly with SQL
+	var myValue int
+	var relatedCount int
+	err = db.Raw("SELECT my_value FROM parent_models WHERE id = ?", parentID).Row().Scan(&myValue)
+	assert.NoError(t, err)
+	assert.Equal(t, 20, myValue)
+
+	err = db.Raw("SELECT COUNT(*) FROM related_models WHERE parent_id = ?", parentID).Row().Scan(&relatedCount)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, relatedCount)
 }

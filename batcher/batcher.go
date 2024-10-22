@@ -12,12 +12,19 @@ type BatchProcessorInterface[T any] interface {
 }
 
 // BatchProcessor is a generic batch processor
+type MetricsCollector interface {
+	Setup(batcher *BatchProcessor[any])
+	Collect(metrics BatchMetrics)
+}
+
 type BatchProcessor[T any] struct {
-	input        chan batchItem[T]
-	maxBatchSize int
-	maxWaitTime  time.Duration
-	processFn    func([]T) []error
-	ctx          context.Context
+	input            chan batchItem[T]
+	maxBatchSize     int
+	maxWaitTime      time.Duration
+	processFn        func([]T) []error
+	ctx              context.Context
+	metrics          *BatchMetrics
+	metricsCollector MetricsCollector
 }
 
 type batchItem[T any] struct {
@@ -32,12 +39,45 @@ func NewBatchProcessor[T any](
 	ctx context.Context,
 	processFn func([]T) []error,
 ) BatchProcessorInterface[T] {
+	return NewBatchProcessorWithOptions(
+		ctx,
+		processFn,
+		WithMaxBatchSize[T](maxBatchSize),
+		WithMaxWaitTime[T](maxWaitTime),
+	)
+}
+
+type BatchProcessorOption[T any] func(*BatchProcessor[T])
+
+func WithMaxBatchSize[T any](size int) BatchProcessorOption[T] {
+	return func(bp *BatchProcessor[T]) {
+		bp.maxBatchSize = size
+	}
+}
+
+func WithMaxWaitTime[T any](duration time.Duration) BatchProcessorOption[T] {
+	return func(bp *BatchProcessor[T]) {
+		bp.maxWaitTime = duration
+	}
+}
+
+func NewBatchProcessorWithOptions[T any](
+	ctx context.Context,
+	processFn func([]T) []error,
+	options ...BatchProcessorOption[T],
+) BatchProcessorInterface[T] {
 	bp := &BatchProcessor[T]{
-		input:        make(chan batchItem[T]),
-		maxBatchSize: maxBatchSize,
-		maxWaitTime:  maxWaitTime,
-		processFn:    processFn,
-		ctx:          ctx,
+		input:            make(chan batchItem[T]),
+		maxBatchSize:     100,         // Default max batch size
+		maxWaitTime:      time.Second, // Default max wait time
+		processFn:        processFn,
+		ctx:              ctx,
+		metrics:          &BatchMetrics{},
+		metricsCollector: nil, // Initialize with nil
+	}
+
+	for _, option := range options {
+		option(bp)
 	}
 
 	go bp.run()
@@ -86,9 +126,27 @@ func (bp *BatchProcessor[T]) run() {
 		if len(batch) == 0 {
 			return
 		}
+		startTime := time.Now()
 		errs := bp.processFn(batch)
 		for i, ch := range respChans {
 			ch <- errs[i]
+		}
+
+		// Collect metrics after processing the batch
+		if bp.metricsCollector != nil {
+			errorCount := 0
+			for _, err := range errs {
+				if err != nil {
+					errorCount++
+				}
+			}
+
+			bp.metricsCollector.Collect(BatchMetrics{
+				BatchesProcessed:    1,
+				ItemsProcessed:      int64(len(batch)),
+				TotalProcessingTime: time.Since(startTime),
+				Errors:              int64(errorCount),
+			})
 		}
 		batch = nil
 		respChans = nil
@@ -119,11 +177,23 @@ func (bp *BatchProcessor[T]) run() {
 		}
 	}
 }
-
 func RepeatErr(n int, err error) []error {
 	result := make([]error, n)
 	for i := 0; i < n; i++ {
 		result[i] = err
 	}
 	return result
+}
+
+type BatchMetrics struct {
+	BatchesProcessed    int64
+	ItemsProcessed      int64
+	TotalProcessingTime time.Duration
+	Errors              int64
+}
+
+func WithMetrics[T any](collector MetricsCollector) BatchProcessorOption[T] {
+	return func(bp *BatchProcessor[T]) {
+		bp.metricsCollector = collector
+	}
 }
