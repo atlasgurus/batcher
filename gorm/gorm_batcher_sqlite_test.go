@@ -1,4 +1,4 @@
-//go:build !sqlite
+//go:build sqlite
 
 package gorm
 
@@ -15,6 +15,7 @@ import (
 	gormv1 "github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/mysql"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
+	_ "github.com/jinzhu/gorm/dialects/sqlite"
 	"github.com/stretchr/testify/assert"
 	gormv2 "gorm.io/gorm"
 )

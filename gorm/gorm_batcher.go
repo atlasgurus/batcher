@@ -12,7 +12,6 @@ import (
 	"unicode"
 
 	"github.com/atlasgurus/batcher/batcher"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -38,15 +37,24 @@ type UpdateItem[T any] struct {
 	UpdateFields []string
 }
 
-// NewInsertBatcher creates a new GORM insert batcher
+// Legacy constructor calls the new options-based one
 func NewInsertBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) *InsertBatcher[T] {
+	return NewInsertBatcherWithOptions[T](
+		dbProvider,
+		ctx,
+		batcher.WithMaxBatchSize[[]T](maxBatchSize),
+		batcher.WithMaxWaitTime[[]T](maxWaitTime),
+	)
+}
+
+// Primary constructor using options
+func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, opts ...batcher.BatchProcessorOption[[]T]) *InsertBatcher[T] {
 	return &InsertBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchInsert[T](dbProvider)),
+		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchInsert[T](dbProvider), opts...),
 	}
 }
 
-// NewUpdateBatcher creates a new GORM update batcher
 // Helper function to get table name from struct
 func getTableName[T any]() string {
 	var model T
@@ -64,12 +72,19 @@ func getTableName[T any]() string {
 	return toSnakeCase(t.Name()) + "s"
 }
 
-// NewUpdateBatcher creates a new GORM update batcher
+// Legacy constructor calls the new options-based one
 func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) (*UpdateBatcher[T], error) {
-	// Get table name directly from the type
-	tableName := getTableName[T]()
+	return NewUpdateBatcherWithOptions[T](
+		dbProvider,
+		ctx,
+		batcher.WithMaxBatchSize[[]UpdateItem[T]](maxBatchSize),
+		batcher.WithMaxWaitTime[[]UpdateItem[T]](maxWaitTime),
+	)
+}
 
-	// Get primary key info directly using reflection
+// NewUpdateBatcherWithOptions primary constructor using options
+func NewUpdateBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, opts ...batcher.BatchProcessorOption[[]UpdateItem[T]]) (*UpdateBatcher[T], error) {
+	tableName := getTableName[T]()
 	var model T
 	t := reflect.TypeOf(model)
 	primaryKeyField, primaryKeyName, keyErr := getPrimaryKeyInfo(t)
@@ -79,7 +94,7 @@ func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 
 	return &UpdateBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchUpdate[T](dbProvider, tableName, primaryKeyField, primaryKeyName)),
+		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchUpdate[T](dbProvider, tableName, primaryKeyField, primaryKeyName), opts...),
 		tableName:  tableName,
 	}, nil
 }
@@ -422,21 +437,28 @@ type SelectItem[T any] struct {
 	Results   *[]T
 }
 
+// NewSelectBatcher creates a new SelectBatcher
 func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context, columns []string) (*SelectBatcher[T], error) {
-	// Create a temporary in-memory SQLite database
-	tempDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary database: %w", err)
-	}
+	return NewSelectBatcherWithOptions[T](
+		dbProvider,
+		ctx,
+		columns,
+		batcher.WithMaxBatchSize[[]SelectItem[T]](maxBatchSize),
+		batcher.WithMaxWaitTime[[]SelectItem[T]](maxWaitTime),
+	)
+}
 
+// NewSelectBatcherWithOptions creates a new SelectBatcher with custom options
+func NewSelectBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, columns []string, opts ...batcher.BatchProcessorOption[[]SelectItem[T]]) (*SelectBatcher[T], error) {
+	tableName := getTableName[T]()
+
+	// Validate columns against model
 	var model T
-	stmt := &gorm.Statement{DB: tempDB}
-	err = stmt.Parse(&model)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse model for table name: %w", err)
+	t := reflect.TypeOf(model)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
 	}
 
-	// Validate that all specified columns exist in the model
 	allColumns, err := getColumnNames(model)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get column names: %w", err)
@@ -455,8 +477,8 @@ func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 
 	return &SelectBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchSelect[T](dbProvider, stmt.Table, columns)),
-		tableName:  stmt.Table,
+		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchSelect[T](dbProvider, tableName, columns), opts...),
+		tableName:  tableName,
 		columns:    columns,
 	}, nil
 }
