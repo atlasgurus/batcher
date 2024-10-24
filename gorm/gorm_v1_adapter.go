@@ -6,7 +6,6 @@ import (
 	gormv1 "github.com/jinzhu/gorm"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/driver/sqlserver"
 	gormv2 "gorm.io/gorm"
 )
@@ -28,9 +27,7 @@ func GormV1ToV2Adapter(v1DB *gormv1.DB) (*gormv2.DB, error) {
 			Conn: sqlDB,
 		})
 	case "sqlite3":
-		dialector = &sqlite.Dialector{
-			Conn: sqlDB,
-		}
+		dialector = getSQLiteDialector(sqlDB)
 	case "mssql":
 		dialector = sqlserver.New(sqlserver.Config{
 			Conn: sqlDB,
