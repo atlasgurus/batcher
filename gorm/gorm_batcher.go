@@ -12,7 +12,6 @@ import (
 	"unicode"
 
 	"github.com/atlasgurus/batcher/batcher"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -423,17 +422,14 @@ type SelectItem[T any] struct {
 }
 
 func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context, columns []string) (*SelectBatcher[T], error) {
-	// Create a temporary in-memory SQLite database
-	tempDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary database: %w", err)
-	}
+	// Get table name directly from the type
+	tableName := getTableName[T]()
 
+	// Validate columns against model
 	var model T
-	stmt := &gorm.Statement{DB: tempDB}
-	err = stmt.Parse(&model)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse model for table name: %w", err)
+	t := reflect.TypeOf(model)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
 	}
 
 	// Validate that all specified columns exist in the model
@@ -455,12 +451,11 @@ func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 
 	return &SelectBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchSelect[T](dbProvider, stmt.Table, columns)),
-		tableName:  stmt.Table,
+		batcher:    batcher.NewBatchProcessor(maxBatchSize, maxWaitTime, ctx, batchSelect[T](dbProvider, tableName, columns)),
+		tableName:  tableName,
 		columns:    columns,
 	}, nil
 }
-
 func (b *SelectBatcher[T]) Select(condition string, args ...interface{}) ([]T, error) {
 	var results []T
 	item := SelectItem[T]{
