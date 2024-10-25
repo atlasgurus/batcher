@@ -5,6 +5,26 @@ import (
 	"time"
 )
 
+// MetricsCollector defines the interface for collecting batch processing metrics
+type MetricsCollector interface {
+	Collect(metrics BatchMetrics)
+}
+
+// BatchProcessorConfig holds all configuration options for the batch processor
+type BatchProcessorConfig struct {
+	MaxBatchSize     int
+	MaxWaitTime      time.Duration
+	MetricsCollector MetricsCollector
+}
+
+// DefaultConfig returns a BatchProcessorConfig with default values
+func DefaultConfig() BatchProcessorConfig {
+	return BatchProcessorConfig{
+		MaxBatchSize: 100,
+		MaxWaitTime:  time.Second,
+	}
+}
+
 // BatchProcessorInterface defines the common interface for batch processors
 type BatchProcessorInterface[T any] interface {
 	SubmitAndWait(item T) error
@@ -12,24 +32,41 @@ type BatchProcessorInterface[T any] interface {
 }
 
 // BatchProcessor is a generic batch processor
-type MetricsCollector interface {
-	Setup(batcher *BatchProcessor[any])
-	Collect(metrics BatchMetrics)
-}
-
 type BatchProcessor[T any] struct {
-	input            chan batchItem[T]
-	maxBatchSize     int
-	maxWaitTime      time.Duration
-	processFn        func([]T) []error
-	ctx              context.Context
-	metrics          *BatchMetrics
-	metricsCollector MetricsCollector
+	input     chan batchItem[T]
+	config    BatchProcessorConfig
+	processFn func([]T) []error
+	ctx       context.Context
+	metrics   *BatchMetrics
 }
 
 type batchItem[T any] struct {
 	item T
 	resp chan error
+}
+
+// Option defines a function type for modifying BatchProcessorConfig
+type Option func(*BatchProcessorConfig)
+
+// WithMaxBatchSize sets the maximum batch size
+func WithMaxBatchSize(size int) Option {
+	return func(config *BatchProcessorConfig) {
+		config.MaxBatchSize = size
+	}
+}
+
+// WithMaxWaitTime sets the maximum wait time
+func WithMaxWaitTime(duration time.Duration) Option {
+	return func(config *BatchProcessorConfig) {
+		config.MaxWaitTime = duration
+	}
+}
+
+// WithMetrics sets the metrics collector
+func WithMetrics(collector MetricsCollector) Option {
+	return func(config *BatchProcessorConfig) {
+		config.MetricsCollector = collector
+	}
 }
 
 // NewBatchProcessor creates a new BatchProcessor
@@ -42,42 +79,29 @@ func NewBatchProcessor[T any](
 	return NewBatchProcessorWithOptions(
 		ctx,
 		processFn,
-		WithMaxBatchSize[T](maxBatchSize),
-		WithMaxWaitTime[T](maxWaitTime),
+		WithMaxBatchSize(maxBatchSize),
+		WithMaxWaitTime(maxWaitTime),
 	)
-}
-
-type BatchProcessorOption[T any] func(*BatchProcessor[T])
-
-func WithMaxBatchSize[T any](size int) BatchProcessorOption[T] {
-	return func(bp *BatchProcessor[T]) {
-		bp.maxBatchSize = size
-	}
-}
-
-func WithMaxWaitTime[T any](duration time.Duration) BatchProcessorOption[T] {
-	return func(bp *BatchProcessor[T]) {
-		bp.maxWaitTime = duration
-	}
 }
 
 func NewBatchProcessorWithOptions[T any](
 	ctx context.Context,
 	processFn func([]T) []error,
-	options ...BatchProcessorOption[T],
+	options ...Option,
 ) BatchProcessorInterface[T] {
-	bp := &BatchProcessor[T]{
-		input:            make(chan batchItem[T]),
-		maxBatchSize:     100,         // Default max batch size
-		maxWaitTime:      time.Second, // Default max wait time
-		processFn:        processFn,
-		ctx:              ctx,
-		metrics:          &BatchMetrics{},
-		metricsCollector: nil, // Initialize with nil
+	config := DefaultConfig()
+
+	// Apply all options
+	for _, option := range options {
+		option(&config)
 	}
 
-	for _, option := range options {
-		option(bp)
+	bp := &BatchProcessor[T]{
+		input:     make(chan batchItem[T]),
+		config:    config,
+		processFn: processFn,
+		ctx:       ctx,
+		metrics:   &BatchMetrics{},
 	}
 
 	go bp.run()
@@ -86,7 +110,6 @@ func NewBatchProcessorWithOptions[T any](
 }
 
 // SubmitAndWait submits an item for processing and waits for the result
-// If the context is canceled, it processes the item directly
 func (bp *BatchProcessor[T]) SubmitAndWait(item T) error {
 	respChan := make(chan error, 1)
 	select {
@@ -98,9 +121,7 @@ func (bp *BatchProcessor[T]) SubmitAndWait(item T) error {
 	}
 }
 
-// Submit submits an item for processing and calls the callback function when done.
-// If the context is canceled, it processes the item directly.
-// The function is non-blocking
+// Submit submits an item for processing and calls the callback function when done
 func (bp *BatchProcessor[T]) Submit(item T, callback func(error)) {
 	respChan := make(chan error, 1)
 	select {
@@ -118,7 +139,7 @@ func (bp *BatchProcessor[T]) Submit(item T, callback func(error)) {
 func (bp *BatchProcessor[T]) run() {
 	var batch []T
 	var respChans []chan error
-	timer := time.NewTimer(bp.maxWaitTime)
+	timer := time.NewTimer(bp.config.MaxWaitTime)
 	timer.Stop() // Immediately stop the timer as it's not needed yet
 	timerActive := false
 
@@ -133,7 +154,7 @@ func (bp *BatchProcessor[T]) run() {
 		}
 
 		// Collect metrics after processing the batch
-		if bp.metricsCollector != nil {
+		if bp.config.MetricsCollector != nil {
 			errorCount := 0
 			for _, err := range errs {
 				if err != nil {
@@ -141,7 +162,7 @@ func (bp *BatchProcessor[T]) run() {
 				}
 			}
 
-			bp.metricsCollector.Collect(BatchMetrics{
+			bp.config.MetricsCollector.Collect(BatchMetrics{
 				BatchesProcessed:    1,
 				ItemsProcessed:      int64(len(batch)),
 				TotalProcessingTime: time.Since(startTime),
@@ -162,10 +183,10 @@ func (bp *BatchProcessor[T]) run() {
 			batch = append(batch, item.item)
 			respChans = append(respChans, item.resp)
 			if len(batch) == 1 && !timerActive {
-				timer.Reset(bp.maxWaitTime)
+				timer.Reset(bp.config.MaxWaitTime)
 				timerActive = true
 			}
-			if len(batch) >= bp.maxBatchSize {
+			if len(batch) >= bp.config.MaxBatchSize {
 				processBatch()
 			}
 		case <-timer.C:
@@ -177,6 +198,7 @@ func (bp *BatchProcessor[T]) run() {
 		}
 	}
 }
+
 func RepeatErr(n int, err error) []error {
 	result := make([]error, n)
 	for i := 0; i < n; i++ {
@@ -190,10 +212,4 @@ type BatchMetrics struct {
 	ItemsProcessed      int64
 	TotalProcessingTime time.Duration
 	Errors              int64
-}
-
-func WithMetrics[T any](collector MetricsCollector) BatchProcessorOption[T] {
-	return func(bp *BatchProcessor[T]) {
-		bp.metricsCollector = collector
-	}
 }

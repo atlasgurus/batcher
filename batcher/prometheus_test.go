@@ -30,9 +30,9 @@ func TestPrometheusMetricsCollector(t *testing.T) {
 	batchProcessor := NewBatchProcessorWithOptions(
 		ctx,
 		processFn,
-		WithMaxBatchSize[int](3),
-		WithMaxWaitTime[int](50*time.Millisecond),
-		WithMetrics[int](collector),
+		WithMaxBatchSize(3),
+		WithMaxWaitTime(50*time.Millisecond),
+		WithMetrics(collector),
 	)
 
 	// Process some items
