@@ -37,18 +37,18 @@ type UpdateItem[T any] struct {
 	UpdateFields []string
 }
 
-// Legacy constructor calls the new options-based one
+// NewInsertBatcher creates a new InsertBatcher
 func NewInsertBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) *InsertBatcher[T] {
 	return NewInsertBatcherWithOptions[T](
 		dbProvider,
 		ctx,
-		batcher.WithMaxBatchSize[[]T](maxBatchSize),
-		batcher.WithMaxWaitTime[[]T](maxWaitTime),
+		batcher.WithMaxBatchSize(maxBatchSize),
+		batcher.WithMaxWaitTime(maxWaitTime),
 	)
 }
 
-// Primary constructor using options
-func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, opts ...batcher.BatchProcessorOption[[]T]) *InsertBatcher[T] {
+// NewInsertBatcherWithOptions creates a new InsertBatcher with custom options
+func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, opts ...batcher.Option) *InsertBatcher[T] {
 	return &InsertBatcher[T]{
 		dbProvider: dbProvider,
 		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchInsert[T](dbProvider), opts...),
@@ -77,17 +77,16 @@ func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 	return NewUpdateBatcherWithOptions[T](
 		dbProvider,
 		ctx,
-		batcher.WithMaxBatchSize[[]UpdateItem[T]](maxBatchSize),
-		batcher.WithMaxWaitTime[[]UpdateItem[T]](maxWaitTime),
+		batcher.WithMaxBatchSize(maxBatchSize),
+		batcher.WithMaxWaitTime(maxWaitTime),
 	)
 }
 
 // NewUpdateBatcherWithOptions primary constructor using options
-func NewUpdateBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, opts ...batcher.BatchProcessorOption[[]UpdateItem[T]]) (*UpdateBatcher[T], error) {
+func NewUpdateBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, opts ...batcher.Option) (*UpdateBatcher[T], error) {
 	tableName := getTableName[T]()
 	var model T
-	t := reflect.TypeOf(model)
-	primaryKeyField, primaryKeyName, keyErr := getPrimaryKeyInfo(t)
+	primaryKeyField, primaryKeyName, keyErr := getPrimaryKeyInfo(reflect.TypeOf(model))
 	if keyErr != nil {
 		return nil, keyErr
 	}
@@ -443,13 +442,13 @@ func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 		dbProvider,
 		ctx,
 		columns,
-		batcher.WithMaxBatchSize[[]SelectItem[T]](maxBatchSize),
-		batcher.WithMaxWaitTime[[]SelectItem[T]](maxWaitTime),
+		batcher.WithMaxBatchSize(maxBatchSize),
+		batcher.WithMaxWaitTime(maxWaitTime),
 	)
 }
 
 // NewSelectBatcherWithOptions creates a new SelectBatcher with custom options
-func NewSelectBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, columns []string, opts ...batcher.BatchProcessorOption[[]SelectItem[T]]) (*SelectBatcher[T], error) {
+func NewSelectBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, columns []string, opts ...batcher.Option) (*SelectBatcher[T], error) {
 	tableName := getTableName[T]()
 
 	// Validate columns against model
