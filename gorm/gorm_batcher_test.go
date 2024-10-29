@@ -20,9 +20,10 @@ import (
 )
 
 type TestModel struct {
-	ID      uint   `gorm:"primaryKey"`
-	Name    string `gorm:"type:varchar(100)"`
-	MyValue int    `gorm:"type:int"`
+	ID        uint   `gorm:"primaryKey"`
+	Name      string `gorm:"type:varchar(100)"`
+	MyValue   int    `gorm:"type:int"`
+	UpdatedAt time.Time
 }
 
 type CompositeKeyModel struct {
@@ -85,7 +86,7 @@ func TestMain(m *testing.M) {
 
 func getDBProvider() DBProvider {
 	return func() (*gormv2.DB, error) {
-		return db, nil
+		return db.Debug(), nil
 	}
 }
 
@@ -945,4 +946,235 @@ func TestUpdateBatcherWithRelationships(t *testing.T) {
 	err = db.Raw("SELECT COUNT(*) FROM related_models WHERE parent_id = ?", parentID).Row().Scan(&relatedCount)
 	assert.NoError(t, err)
 	assert.Equal(t, 2, relatedCount)
+}
+
+func TestUpdateBatcherDuplicateIDs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert initial model
+	initialTime := time.Date(2024, 10, 29, 21, 0, 0, 0, time.UTC)
+	initialModel := &TestModel{
+		ID:        1,
+		Name:      "Initial",
+		MyValue:   10,
+		UpdatedAt: initialTime,
+	}
+	result := db.Create(initialModel)
+	assert.NoError(t, result.Error)
+
+	// Queue multiple updates to the same ID with different timestamps
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	time1 := time.Date(2024, 10, 29, 21, 2, 42, 0, time.UTC)
+	batcher.UpdateAsync(func(err error) {
+		assert.NoError(t, err)
+		wg.Done()
+	}, []*TestModel{{
+		ID:        1,
+		Name:      "Update 1",
+		MyValue:   20,
+		UpdatedAt: time1,
+	}}, []string{"name", "my_value", "updated_at"})
+
+	time2 := time.Date(2024, 10, 29, 21, 6, 56, 0, time.UTC)
+	batcher.UpdateAsync(func(err error) {
+		assert.NoError(t, err)
+		wg.Done()
+	}, []*TestModel{{
+		ID:        1,
+		Name:      "Update 2",
+		MyValue:   30,
+		UpdatedAt: time2,
+	}}, []string{"name", "my_value", "updated_at"})
+
+	time3 := time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC)
+	batcher.UpdateAsync(func(err error) {
+		assert.NoError(t, err)
+		wg.Done()
+	}, []*TestModel{{
+		ID:        1,
+		Name:      "Update 3",
+		MyValue:   40,
+		UpdatedAt: time3,
+	}}, []string{"name", "my_value", "updated_at"})
+
+	// Wait for callbacks
+	wg.Wait()
+
+	// Wait a bit longer than the batch interval to ensure all updates are processed
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify final state
+	var finalModel TestModel
+	err = db.First(&finalModel, 1).Error
+	assert.NoError(t, err)
+
+	// The CASE statement ordering means the last matching condition wins
+	assert.Equal(t, "Update 3", finalModel.Name)
+	assert.Equal(t, 40, finalModel.MyValue)
+	assert.Equal(t, time3, finalModel.UpdatedAt)
+}
+
+func TestUpdateBatcherFieldMerging(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert initial model
+	initialModel := &TestModel{
+		ID:        1,
+		Name:      "Initial",
+		MyValue:   10,
+		UpdatedAt: time.Date(2024, 10, 29, 21, 0, 0, 0, time.UTC),
+	}
+	result := db.Create(initialModel)
+	assert.NoError(t, result.Error)
+
+	// Queue multiple updates to the same ID affecting different fields
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// First update changes Name only
+	batcher.UpdateAsync(func(err error) {
+		assert.NoError(t, err)
+		wg.Done()
+	}, []*TestModel{{
+		ID:        1,
+		Name:      "Update Name",
+		MyValue:   10, // unchanged
+		UpdatedAt: time.Date(2024, 10, 29, 21, 2, 42, 0, time.UTC),
+	}}, []string{"name", "updated_at"})
+
+	// Second update changes MyValue only
+	batcher.UpdateAsync(func(err error) {
+		assert.NoError(t, err)
+		wg.Done()
+	}, []*TestModel{{
+		ID:        1,
+		Name:      "Update Name", // same as previous update
+		MyValue:   20,            // changed
+		UpdatedAt: time.Date(2024, 10, 29, 21, 6, 56, 0, time.UTC),
+	}}, []string{"my_value", "updated_at"})
+
+	// Third update changes both
+	batcher.UpdateAsync(func(err error) {
+		assert.NoError(t, err)
+		wg.Done()
+	}, []*TestModel{{
+		ID:        1,
+		Name:      "Final Name",
+		MyValue:   30,
+		UpdatedAt: time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC),
+	}}, []string{"name", "my_value", "updated_at"})
+
+	// Wait for callbacks
+	wg.Wait()
+
+	// Wait a bit longer than the batch interval to ensure all updates are processed
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify final state
+	var finalModel TestModel
+	err = db.First(&finalModel, 1).Error
+	assert.NoError(t, err)
+
+	// The last update in the batch should take precedence
+	assert.Equal(t, "Final Name", finalModel.Name)
+	assert.Equal(t, 30, finalModel.MyValue)
+	assert.Equal(t, time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC), finalModel.UpdatedAt)
+}
+
+func TestUpdateBatcherFieldMergingMultipleIDs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert initial models
+	initialModels := make([]*TestModel, 10)
+	for i := 0; i < 10; i++ {
+		initialModels[i] = &TestModel{
+			ID:        uint(i + 1),
+			Name:      fmt.Sprintf("Initial %d", i+1),
+			MyValue:   i * 10,
+			UpdatedAt: time.Date(2024, 10, 29, 21, 0, 0, 0, time.UTC),
+		}
+	}
+	result := db.Create(&initialModels)
+	assert.NoError(t, result.Error)
+
+	// Queue multiple updates for each ID affecting different fields
+	var wg sync.WaitGroup
+	wg.Add(30) // 3 updates for each of the 10 IDs
+
+	for i := 0; i < 10; i++ {
+		id := uint(i + 1)
+
+		// First update changes Name only
+		batcher.UpdateAsync(func(err error) {
+			assert.NoError(t, err)
+			wg.Done()
+		}, []*TestModel{{
+			ID:        id,
+			Name:      fmt.Sprintf("Update Name %d", id),
+			MyValue:   initialModels[i].MyValue, // unchanged
+			UpdatedAt: time.Date(2024, 10, 29, 21, 2, 42, 0, time.UTC),
+		}}, []string{"name", "updated_at"})
+
+		// Second update changes MyValue only
+		batcher.UpdateAsync(func(err error) {
+			assert.NoError(t, err)
+			wg.Done()
+		}, []*TestModel{{
+			ID:        id,
+			Name:      fmt.Sprintf("Update Name %d", id), // same as previous update
+			MyValue:   initialModels[i].MyValue + 5,      // changed
+			UpdatedAt: time.Date(2024, 10, 29, 21, 6, 56, 0, time.UTC),
+		}}, []string{"my_value", "updated_at"})
+
+		// Third update changes both
+		batcher.UpdateAsync(func(err error) {
+			assert.NoError(t, err)
+			wg.Done()
+		}, []*TestModel{{
+			ID:        id,
+			Name:      fmt.Sprintf("Final Name %d", id),
+			MyValue:   initialModels[i].MyValue + 10,
+			UpdatedAt: time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC),
+		}}, []string{"name", "my_value", "updated_at"})
+	}
+
+	// Wait for callbacks
+	wg.Wait()
+
+	// Verify final state for all records
+	var finalModels []TestModel
+	err = db.Order("id").Find(&finalModels).Error
+	assert.NoError(t, err)
+	assert.Equal(t, 10, len(finalModels))
+
+	// Verify each record
+	for i, model := range finalModels {
+		assert.Equal(t, uint(i+1), model.ID)
+		assert.Equal(t, fmt.Sprintf("Final Name %d", i+1), model.Name)
+		assert.Equal(t, initialModels[i].MyValue+10, model.MyValue)
+		assert.Equal(t, time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC), model.UpdatedAt)
+	}
 }
