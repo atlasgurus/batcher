@@ -224,8 +224,12 @@ func batchUpdate[T any](
 			return batcher.RepeatErr(len(batches), err)
 		}
 
-		// Add this map to track the latest update for each ID
-		latestUpdates := make(map[string]UpdateItem[T])
+		// Track both the latest values and all fields to update for each ID
+		type combinedUpdate struct {
+			item         T
+			updateFields map[string]bool
+		}
+		latestUpdates := make(map[string]combinedUpdate)
 
 		for _, updateItem := range allUpdateItems {
 			item := updateItem.Item
@@ -241,14 +245,34 @@ func batchUpdate[T any](
 			}
 			compositeKey := strings.Join(keyParts, "-")
 
-			// Store only the latest update for each ID
-			latestUpdates[compositeKey] = updateItem
+			// Get or create the combined update
+			combined, exists := latestUpdates[compositeKey]
+			if !exists {
+				combined = combinedUpdate{
+					item:         item,
+					updateFields: make(map[string]bool),
+				}
+			}
+			// Keep the latest value
+			combined.item = item
+			// Merge the fields to update
+			for _, field := range updateItem.UpdateFields {
+				combined.updateFields[field] = true
+			}
+			latestUpdates[compositeKey] = combined
 		}
 
-		// Use only the latest updates
+		// Convert back to UpdateItems
 		deduplicatedItems := make([]UpdateItem[T], 0, len(latestUpdates))
-		for _, item := range latestUpdates {
-			deduplicatedItems = append(deduplicatedItems, item)
+		for _, combined := range latestUpdates {
+			fields := make([]string, 0, len(combined.updateFields))
+			for field := range combined.updateFields {
+				fields = append(fields, field)
+			}
+			deduplicatedItems = append(deduplicatedItems, UpdateItem[T]{
+				Item:         combined.item,
+				UpdateFields: fields,
+			})
 		}
 
 		// Replace original slice with deduplicated one
@@ -278,7 +302,6 @@ func batchUpdate[T any](
 				}
 			}
 
-			// Always include updated_at field if it exists in the model but not in the fieldsToUpdate
 			_, updatedAtExists := itemType.FieldByName("UpdatedAt")
 			if updatedAtExists && !contains(fieldsToUpdate, "UpdatedAt") && !contains(fieldsToUpdate, "updated_at") {
 				fieldsToUpdate = append(fieldsToUpdate, "UpdatedAt")
@@ -361,6 +384,7 @@ func batchUpdate[T any](
 		return batcher.RepeatErr(len(batches), nil)
 	}
 }
+
 func isDeadlockError(err error) bool {
 	return strings.Contains(err.Error(), "Deadlock found when trying to get lock") ||
 		strings.Contains(err.Error(), "database table is locked") ||
