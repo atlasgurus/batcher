@@ -263,7 +263,7 @@ func executeIndividualUpdates[T any](
 	return tx.Exec(queryBuilder.String(), values...).Error
 }
 
-var disableBatchUpdate = true
+var disableBatchUpdate = false
 
 func batchUpdate[T any](
 	dbProvider DBProvider,
@@ -467,7 +467,7 @@ func batchUpdate[T any](
 				}
 			}
 			if len(fallbackErrors) > 0 {
-				return fmt.Errorf("some individual updates failed: %v", fallbackErrors)
+				return fmt.Errorf("%d individual updates failed: (%v)", len(fallbackErrors), fallbackErrors)
 			}
 			return nil
 		})
@@ -938,13 +938,13 @@ func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation
 		// Wrap everything in a transaction to ensure proper cleanup
 		err = db.Transaction(func(tx *gorm.DB) error {
 			// Create session within transaction
-			sessionDB := tx.Session(&gorm.Session{
-				Context: context.WithValue(context.Background(), "lock_wait_timeout", 1),
-			})
+			sessionDB := tx.Session(&gorm.Session{})
 
-			// Set timeout for this session
-			if err := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = 1").Error; err != nil {
-				return fmt.Errorf("failed to set session timeout: %w", err)
+			if db.Dialector.Name() == "mysql" {
+				// Set timeout for this session
+				if timeoutSetErr := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = 1").Error; timeoutSetErr != nil {
+					return fmt.Errorf("failed to set session timeout: %w", timeoutSetErr)
+				}
 			}
 
 			// Execute the operation
