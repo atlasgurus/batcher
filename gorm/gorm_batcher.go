@@ -190,6 +190,81 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
 	}
 }
 
+func executeIndividualUpdates[T any](
+	tx *gorm.DB,
+	tableName string,
+	primaryKeyFields []reflect.StructField,
+	primaryKeyNames []string,
+	updateItem UpdateItem[T],
+	mapping fieldMapping,
+) error {
+	item := updateItem.Item
+	itemValue := reflect.ValueOf(item)
+	if itemValue.Kind() == reflect.Ptr {
+		itemValue = itemValue.Elem()
+	}
+	itemType := itemValue.Type()
+
+	// Determine fields to update
+	fieldsToUpdate := updateItem.UpdateFields
+	if len(fieldsToUpdate) == 0 {
+		// Update all fields except the primary key
+		for i := 0; i < itemType.NumField(); i++ {
+			field := itemType.Field(i)
+			if !isPrimaryKey(field) {
+				fieldsToUpdate = append(fieldsToUpdate, field.Name)
+			}
+		}
+	}
+
+	// Add UpdatedAt if it exists and isn't already included
+	_, updatedAtExists := itemType.FieldByName("UpdatedAt")
+	if updatedAtExists && !contains(fieldsToUpdate, "UpdatedAt") && !contains(fieldsToUpdate, "updated_at") {
+		fieldsToUpdate = append(fieldsToUpdate, "UpdatedAt")
+	}
+
+	// Build the update query
+	var queryBuilder strings.Builder
+	queryBuilder.WriteString(fmt.Sprintf("UPDATE %s SET ", tableName))
+
+	var values []interface{}
+
+	// Add SET clause
+	for i, fieldName := range fieldsToUpdate {
+		structFieldName, dbFieldName, err := getFieldNames(fieldName, mapping)
+		if err != nil {
+			return err
+		}
+
+		if i > 0 {
+			queryBuilder.WriteString(", ")
+		}
+		queryBuilder.WriteString(fmt.Sprintf("%s = ?", dbFieldName))
+
+		var fieldValue interface{}
+		if fieldName == "UpdatedAt" {
+			fieldValue = time.Now()
+		} else {
+			fieldValue = itemValue.FieldByName(structFieldName).Interface()
+		}
+		values = append(values, fieldValue)
+	}
+
+	// Add WHERE clause for primary keys
+	queryBuilder.WriteString(" WHERE ")
+	for i, pkField := range primaryKeyFields {
+		if i > 0 {
+			queryBuilder.WriteString(" AND ")
+		}
+		queryBuilder.WriteString(fmt.Sprintf("%s = ?", primaryKeyNames[i]))
+		values = append(values, itemValue.FieldByName(pkField.Name).Interface())
+	}
+
+	return tx.Exec(queryBuilder.String(), values...).Error
+}
+
+var disableBatchUpdate = true
+
 func batchUpdate[T any](
 	dbProvider DBProvider,
 	tableName string,
@@ -363,14 +438,46 @@ func batchUpdate[T any](
 			allValues = append(allValues, pkValues)
 		}
 
+		var batchErr error
+		if !disableBatchUpdate {
+			// Try batch update first
+			batchErr = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+				return tx.Exec(queryBuilder.String(), allValues...).Error
+			})
+
+			// If batch update succeeds, return success
+			if batchErr == nil {
+				return batcher.RepeatErr(len(batches), nil)
+			}
+		}
+
+		// If batch update fails, try individual updates
+		var fallbackErrors []error
 		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
-			return tx.Exec(queryBuilder.String(), allValues...).Error
+			for _, updateItem := range allUpdateItems {
+				if err := executeIndividualUpdates(
+					tx,
+					tableName,
+					primaryKeyFields,
+					primaryKeyNames,
+					updateItem,
+					mapping,
+				); err != nil {
+					fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", err))
+				}
+			}
+			if len(fallbackErrors) > 0 {
+				return fmt.Errorf("some individual updates failed: %v", fallbackErrors)
+			}
+			return nil
 		})
 
 		if err != nil {
-			return batcher.RepeatErr(len(batches), err)
+			// Both batch and individual updates failed
+			return batcher.RepeatErr(len(batches), fmt.Errorf("batch update failed: %v, individual updates failed: %v", batchErr, err))
 		}
 
+		// Individual updates succeeded
 		return batcher.RepeatErr(len(batches), nil)
 	}
 }

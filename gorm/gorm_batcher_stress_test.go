@@ -20,7 +20,7 @@ func TestUpdateBatcherStressWithData(t *testing.T) {
 
 	batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
 	assert.NoError(t, err)
-	createNewTable := true
+	createNewTable := false
 
 	// Clean up and pre-fill the table
 	numIDs := 10000
@@ -44,7 +44,6 @@ func TestUpdateBatcherStressWithData(t *testing.T) {
 		}
 	}
 
-	// Test both approaches
 	t.Run("CASE Update", func(t *testing.T) {
 		testStressUpdates(t, batcher, numIDs)
 	})
@@ -87,7 +86,6 @@ func testStressUpdates(t *testing.T, batcher *UpdateBatcher[*TestModel], numIDs 
 	}
 
 	wg.Wait()
-	time.Sleep(200 * time.Millisecond)
 	duration := time.Since(start)
 
 	t.Logf("Duration: %v", duration)
