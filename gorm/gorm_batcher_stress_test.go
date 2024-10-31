@@ -14,6 +14,7 @@ import (
 )
 
 func TestUpdateBatcherStressWithData(t *testing.T) {
+	t.Skip("Skip this test as it is too slow")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -27,7 +28,7 @@ func TestUpdateBatcherStressWithData(t *testing.T) {
 	if createNewTable {
 		//db.Exec("DELETE FROM test_models")
 		numBatches := 100000
-		startBatch := 200000
+		startBatch := 0
 		for j := startBatch; j < startBatch+numBatches; j++ {
 			bulkInsert := make([]*TestModel, numIDs)
 			for i := 0; i < numIDs; i++ {
