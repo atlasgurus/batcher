@@ -167,11 +167,6 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
 			return nil
 		}
 
-		db, err := dbProvider()
-		if err != nil {
-			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
-		}
-
 		var allRecords []T
 		for _, batch := range batches {
 			allRecords = append(allRecords, batch...)
@@ -181,8 +176,8 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
-		err = retryWithDeadlockDetection(maxRetries, func() error {
-			return db.Clauses(clause.OnConflict{
+		err := retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+			return tx.Clauses(clause.OnConflict{
 				UpdateAll: true,
 			}).CreateInBatches(allRecords, len(allRecords)).Error
 		})
@@ -203,11 +198,6 @@ func batchUpdate[T any](
 	return func(batches [][]UpdateItem[T]) []error {
 		if len(batches) == 0 {
 			return nil
-		}
-
-		db, err := dbProvider()
-		if err != nil {
-			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
 		}
 
 		var allUpdateItems []UpdateItem[T]
@@ -373,8 +363,8 @@ func batchUpdate[T any](
 			allValues = append(allValues, pkValues)
 		}
 
-		err = retryWithDeadlockDetection(maxRetries, func() error {
-			return db.Exec(queryBuilder.String(), allValues...).Error
+		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+			return tx.Exec(queryBuilder.String(), allValues...).Error
 		})
 
 		if err != nil {
@@ -608,9 +598,9 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
 		var rows *sql.Rows
-		err = retryWithDeadlockDetection(maxRetries, func() error {
+		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
 			var queryErr error
-			rows, queryErr = db.Raw(queryBuilder.String(), args...).Rows()
+			rows, queryErr = tx.Raw(queryBuilder.String(), args...).Rows()
 			return queryErr
 		})
 
@@ -816,10 +806,30 @@ func scanIntoStruct(result interface{}, columns []string, values []interface{}) 
 	return nil
 }
 
-func retryWithDeadlockDetection(maxRetries int, operation func() error) error {
+func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation func(*gorm.DB) error) error {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		err := operation()
+		db, err := dbProvider()
+		if err != nil {
+			return fmt.Errorf("failed to get database connection: %w", err)
+		}
+
+		// Wrap everything in a transaction to ensure proper cleanup
+		err = db.Transaction(func(tx *gorm.DB) error {
+			// Create session within transaction
+			sessionDB := tx.Session(&gorm.Session{
+				Context: context.WithValue(context.Background(), "lock_wait_timeout", 1),
+			})
+
+			// Set timeout for this session
+			if err := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = 1").Error; err != nil {
+				return fmt.Errorf("failed to set session timeout: %w", err)
+			}
+
+			// Execute the operation
+			return operation(sessionDB)
+		})
+
 		if err == nil {
 			return nil
 		}
@@ -828,6 +838,7 @@ func retryWithDeadlockDetection(maxRetries int, operation func() error) error {
 			return fmt.Errorf("operation failed: %w", err)
 		}
 
+		fmt.Printf("Error detected (retrying): %v\n", err)
 		delay := baseDelay * time.Duration(1<<uint(attempt)) * time.Duration(1+rand.Intn(100)) / 100
 		time.Sleep(delay)
 		lastErr = err
