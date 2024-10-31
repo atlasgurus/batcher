@@ -550,6 +550,49 @@ func (b *SelectBatcher[T]) SelectAsync(callback func([]T, error), condition stri
 	})
 }
 
+func processRows[T any](rows *sql.Rows, columns []string, allItems []SelectItem[T]) error {
+	// Prepare a slice of slices to hold all results
+	results := make([][]T, len(allItems))
+	for i := range results {
+		results[i] = make([]T, 0)
+	}
+
+	// Scan the results
+	for rows.Next() {
+		values := make([]interface{}, len(columns)+1) // +1 for __index
+		for i := range values {
+			values[i] = new(interface{})
+		}
+
+		if err := rows.Scan(values...); err != nil {
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		// Get the index
+		indexValue := reflect.ValueOf(values[0]).Elem().Interface()
+		index, err := convertToInt(indexValue)
+		if err != nil {
+			return fmt.Errorf("failed to parse index: %w", err)
+		}
+
+		// Create a new instance of T and scan into it
+		var result T
+		if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
+			return fmt.Errorf("failed to scan into struct: %w", err)
+		}
+
+		// Append the result to the corresponding slice
+		results[index] = append(results[index], result)
+	}
+
+	// Assign results back to the original items
+	for i, item := range allItems {
+		*item.Results = results[i]
+	}
+
+	return nil
+}
+
 func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string) func([][]SelectItem[T]) []error {
 	return func(batches [][]SelectItem[T]) (errs []error) {
 		defer func() {
@@ -597,54 +640,25 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
-		var rows *sql.Rows
+		var processingErr error
 		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
-			var queryErr error
-			rows, queryErr = tx.Raw(queryBuilder.String(), args...).Rows()
-			return queryErr
+			rows, err := tx.Raw(queryBuilder.String(), args...).Rows()
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+
+			// Process the rows within the transaction
+			processingErr = processRows(rows, columns, allItems)
+			return nil
 		})
 
 		if err != nil {
 			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to execute select query: %w", err))
 		}
-		defer rows.Close()
-		// Prepare a slice of slices to hold all results
-		results := make([][]T, len(allItems))
-		for i := range results {
-			results[i] = make([]T, 0)
-		}
 
-		// Scan the results
-		for rows.Next() {
-			values := make([]interface{}, len(columns)+1) // +1 for __index
-			for i := range values {
-				values[i] = new(interface{})
-			}
-
-			if err := rows.Scan(values...); err != nil {
-				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan row: %w", err))
-			}
-
-			// Get the index
-			indexValue := reflect.ValueOf(values[0]).Elem().Interface()
-			index, err := convertToInt(indexValue)
-			if err != nil {
-				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to parse index: %w", err))
-			}
-
-			// Create a new instance of T and scan into it
-			var result T
-			if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
-				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan into struct: %w", err))
-			}
-
-			// Append the result to the corresponding slice
-			results[index] = append(results[index], result)
-		}
-
-		// Assign results back to the original items
-		for i, item := range allItems {
-			*item.Results = results[i]
+		if processingErr != nil {
+			return batcher.RepeatErr(len(batches), processingErr)
 		}
 
 		return batcher.RepeatErr(len(batches), nil)
