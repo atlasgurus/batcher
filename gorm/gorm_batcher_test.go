@@ -86,7 +86,7 @@ func TestMain(m *testing.M) {
 
 func getDBProvider() DBProvider {
 	return func() (*gormv2.DB, error) {
-		return db.Debug(), nil
+		return db, nil
 	}
 }
 

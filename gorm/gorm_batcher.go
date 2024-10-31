@@ -167,11 +167,6 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
 			return nil
 		}
 
-		db, err := dbProvider()
-		if err != nil {
-			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
-		}
-
 		var allRecords []T
 		for _, batch := range batches {
 			allRecords = append(allRecords, batch...)
@@ -181,8 +176,8 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
-		err = retryWithDeadlockDetection(maxRetries, func() error {
-			return db.Clauses(clause.OnConflict{
+		err := retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+			return tx.Clauses(clause.OnConflict{
 				UpdateAll: true,
 			}).CreateInBatches(allRecords, len(allRecords)).Error
 		})
@@ -195,6 +190,81 @@ func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
 	}
 }
 
+func executeIndividualUpdates[T any](
+	tx *gorm.DB,
+	tableName string,
+	primaryKeyFields []reflect.StructField,
+	primaryKeyNames []string,
+	updateItem UpdateItem[T],
+	mapping fieldMapping,
+) error {
+	item := updateItem.Item
+	itemValue := reflect.ValueOf(item)
+	if itemValue.Kind() == reflect.Ptr {
+		itemValue = itemValue.Elem()
+	}
+	itemType := itemValue.Type()
+
+	// Determine fields to update
+	fieldsToUpdate := updateItem.UpdateFields
+	if len(fieldsToUpdate) == 0 {
+		// Update all fields except the primary key
+		for i := 0; i < itemType.NumField(); i++ {
+			field := itemType.Field(i)
+			if !isPrimaryKey(field) {
+				fieldsToUpdate = append(fieldsToUpdate, field.Name)
+			}
+		}
+	}
+
+	// Add UpdatedAt if it exists and isn't already included
+	_, updatedAtExists := itemType.FieldByName("UpdatedAt")
+	if updatedAtExists && !contains(fieldsToUpdate, "UpdatedAt") && !contains(fieldsToUpdate, "updated_at") {
+		fieldsToUpdate = append(fieldsToUpdate, "UpdatedAt")
+	}
+
+	// Build the update query
+	var queryBuilder strings.Builder
+	queryBuilder.WriteString(fmt.Sprintf("UPDATE %s SET ", tableName))
+
+	var values []interface{}
+
+	// Add SET clause
+	for i, fieldName := range fieldsToUpdate {
+		structFieldName, dbFieldName, err := getFieldNames(fieldName, mapping)
+		if err != nil {
+			return err
+		}
+
+		if i > 0 {
+			queryBuilder.WriteString(", ")
+		}
+		queryBuilder.WriteString(fmt.Sprintf("%s = ?", dbFieldName))
+
+		var fieldValue interface{}
+		if fieldName == "UpdatedAt" {
+			fieldValue = time.Now()
+		} else {
+			fieldValue = itemValue.FieldByName(structFieldName).Interface()
+		}
+		values = append(values, fieldValue)
+	}
+
+	// Add WHERE clause for primary keys
+	queryBuilder.WriteString(" WHERE ")
+	for i, pkField := range primaryKeyFields {
+		if i > 0 {
+			queryBuilder.WriteString(" AND ")
+		}
+		queryBuilder.WriteString(fmt.Sprintf("%s = ?", primaryKeyNames[i]))
+		values = append(values, itemValue.FieldByName(pkField.Name).Interface())
+	}
+
+	return tx.Exec(queryBuilder.String(), values...).Error
+}
+
+var disableBatchUpdate = false
+
 func batchUpdate[T any](
 	dbProvider DBProvider,
 	tableName string,
@@ -203,11 +273,6 @@ func batchUpdate[T any](
 	return func(batches [][]UpdateItem[T]) []error {
 		if len(batches) == 0 {
 			return nil
-		}
-
-		db, err := dbProvider()
-		if err != nil {
-			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
 		}
 
 		var allUpdateItems []UpdateItem[T]
@@ -373,14 +438,46 @@ func batchUpdate[T any](
 			allValues = append(allValues, pkValues)
 		}
 
-		err = retryWithDeadlockDetection(maxRetries, func() error {
-			return db.Exec(queryBuilder.String(), allValues...).Error
+		var batchErr error
+		if !disableBatchUpdate {
+			// Try batch update first
+			batchErr = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+				return tx.Exec(queryBuilder.String(), allValues...).Error
+			})
+
+			// If batch update succeeds, return success
+			if batchErr == nil {
+				return batcher.RepeatErr(len(batches), nil)
+			}
+		}
+
+		// If batch update fails, try individual updates
+		var fallbackErrors []error
+		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+			for _, updateItem := range allUpdateItems {
+				if err := executeIndividualUpdates(
+					tx,
+					tableName,
+					primaryKeyFields,
+					primaryKeyNames,
+					updateItem,
+					mapping,
+				); err != nil {
+					fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", err))
+				}
+			}
+			if len(fallbackErrors) > 0 {
+				return fmt.Errorf("%d individual updates failed: (%v)", len(fallbackErrors), fallbackErrors)
+			}
+			return nil
 		})
 
 		if err != nil {
-			return batcher.RepeatErr(len(batches), err)
+			// Both batch and individual updates failed
+			return batcher.RepeatErr(len(batches), fmt.Errorf("batch update failed: %v, individual updates failed: %v", batchErr, err))
 		}
 
+		// Individual updates succeeded
 		return batcher.RepeatErr(len(batches), nil)
 	}
 }
@@ -560,6 +657,49 @@ func (b *SelectBatcher[T]) SelectAsync(callback func([]T, error), condition stri
 	})
 }
 
+func processRows[T any](rows *sql.Rows, columns []string, allItems []SelectItem[T]) error {
+	// Prepare a slice of slices to hold all results
+	results := make([][]T, len(allItems))
+	for i := range results {
+		results[i] = make([]T, 0)
+	}
+
+	// Scan the results
+	for rows.Next() {
+		values := make([]interface{}, len(columns)+1) // +1 for __index
+		for i := range values {
+			values[i] = new(interface{})
+		}
+
+		if err := rows.Scan(values...); err != nil {
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		// Get the index
+		indexValue := reflect.ValueOf(values[0]).Elem().Interface()
+		index, err := convertToInt(indexValue)
+		if err != nil {
+			return fmt.Errorf("failed to parse index: %w", err)
+		}
+
+		// Create a new instance of T and scan into it
+		var result T
+		if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
+			return fmt.Errorf("failed to scan into struct: %w", err)
+		}
+
+		// Append the result to the corresponding slice
+		results[index] = append(results[index], result)
+	}
+
+	// Assign results back to the original items
+	for i, item := range allItems {
+		*item.Results = results[i]
+	}
+
+	return nil
+}
+
 func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string) func([][]SelectItem[T]) []error {
 	return func(batches [][]SelectItem[T]) (errs []error) {
 		defer func() {
@@ -607,54 +747,25 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 
 		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
-		var rows *sql.Rows
-		err = retryWithDeadlockDetection(maxRetries, func() error {
-			var queryErr error
-			rows, queryErr = db.Raw(queryBuilder.String(), args...).Rows()
-			return queryErr
+		var processingErr error
+		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+			rows, err := tx.Raw(queryBuilder.String(), args...).Rows()
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+
+			// Process the rows within the transaction
+			processingErr = processRows(rows, columns, allItems)
+			return nil
 		})
 
 		if err != nil {
 			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to execute select query: %w", err))
 		}
-		defer rows.Close()
-		// Prepare a slice of slices to hold all results
-		results := make([][]T, len(allItems))
-		for i := range results {
-			results[i] = make([]T, 0)
-		}
 
-		// Scan the results
-		for rows.Next() {
-			values := make([]interface{}, len(columns)+1) // +1 for __index
-			for i := range values {
-				values[i] = new(interface{})
-			}
-
-			if err := rows.Scan(values...); err != nil {
-				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan row: %w", err))
-			}
-
-			// Get the index
-			indexValue := reflect.ValueOf(values[0]).Elem().Interface()
-			index, err := convertToInt(indexValue)
-			if err != nil {
-				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to parse index: %w", err))
-			}
-
-			// Create a new instance of T and scan into it
-			var result T
-			if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
-				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to scan into struct: %w", err))
-			}
-
-			// Append the result to the corresponding slice
-			results[index] = append(results[index], result)
-		}
-
-		// Assign results back to the original items
-		for i, item := range allItems {
-			*item.Results = results[i]
+		if processingErr != nil {
+			return batcher.RepeatErr(len(batches), processingErr)
 		}
 
 		return batcher.RepeatErr(len(batches), nil)
@@ -816,10 +927,30 @@ func scanIntoStruct(result interface{}, columns []string, values []interface{}) 
 	return nil
 }
 
-func retryWithDeadlockDetection(maxRetries int, operation func() error) error {
+func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation func(*gorm.DB) error) error {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		err := operation()
+		db, err := dbProvider()
+		if err != nil {
+			return fmt.Errorf("failed to get database connection: %w", err)
+		}
+
+		// Wrap everything in a transaction to ensure proper cleanup
+		err = db.Transaction(func(tx *gorm.DB) error {
+			// Create session within transaction
+			sessionDB := tx.Session(&gorm.Session{})
+
+			if db.Dialector.Name() == "mysql" {
+				// Set timeout for this session
+				if timeoutSetErr := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = 1").Error; timeoutSetErr != nil {
+					return fmt.Errorf("failed to set session timeout: %w", timeoutSetErr)
+				}
+			}
+
+			// Execute the operation
+			return operation(sessionDB)
+		})
+
 		if err == nil {
 			return nil
 		}
@@ -828,6 +959,7 @@ func retryWithDeadlockDetection(maxRetries int, operation func() error) error {
 			return fmt.Errorf("operation failed: %w", err)
 		}
 
+		fmt.Printf("Error detected (retrying): %v\n", err)
 		delay := baseDelay * time.Duration(1<<uint(attempt)) * time.Duration(1+rand.Intn(100)) / 100
 		time.Sleep(delay)
 		lastErr = err
