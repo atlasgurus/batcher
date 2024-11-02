@@ -263,7 +263,85 @@ func executeIndividualUpdates[T any](
 	return tx.Exec(queryBuilder.String(), values...).Error
 }
 
-var disableBatchUpdate = false
+func executeUpdatesBatchAsSeparateStatements[T any](
+	tx *gorm.DB,
+	tableName string,
+	primaryKeyFields []reflect.StructField,
+	primaryKeyNames []string,
+	updateItems []UpdateItem[T],
+	mapping fieldMapping,
+) error {
+	var queryBuilder strings.Builder
+	var allValues []interface{}
+
+	for itemIndex, updateItem := range updateItems {
+		itemValue := reflect.ValueOf(updateItem.Item)
+		if itemValue.Kind() == reflect.Ptr {
+			itemValue = itemValue.Elem()
+		}
+		itemType := itemValue.Type()
+
+		fieldsToUpdate := updateItem.UpdateFields
+		if len(fieldsToUpdate) == 0 {
+			// Update all fields except the primary key
+			for i := 0; i < itemType.NumField(); i++ {
+				field := itemType.Field(i)
+				if !isPrimaryKey(field) {
+					fieldsToUpdate = append(fieldsToUpdate, field.Name)
+				}
+			}
+		}
+
+		_, updatedAtExists := itemType.FieldByName("UpdatedAt")
+		if updatedAtExists && !contains(fieldsToUpdate, "UpdatedAt") && !contains(fieldsToUpdate, "updated_at") {
+			fieldsToUpdate = append(fieldsToUpdate, "UpdatedAt")
+		}
+
+		for i, fieldName := range fieldsToUpdate {
+			if itemIndex > 0 || i > 0 {
+				queryBuilder.WriteString("; ")
+			}
+
+			structFieldName, dbFieldName, err := getFieldNames(fieldName, mapping)
+			if err != nil {
+				return err
+			}
+
+			queryBuilder.WriteString(fmt.Sprintf("UPDATE %s SET %s = ? WHERE (", tableName, dbFieldName))
+			queryBuilder.WriteString(strings.Join(primaryKeyNames, ", "))
+			queryBuilder.WriteString(") = (")
+			queryBuilder.WriteString(strings.Repeat("?,", len(primaryKeyNames)-1) + "?")
+			queryBuilder.WriteString(")")
+
+			// Add the value to update
+			var fieldValue interface{}
+			if fieldName == "UpdatedAt" {
+				fieldValue = time.Now()
+			} else {
+				fieldValue = itemValue.FieldByName(structFieldName).Interface()
+			}
+			allValues = append(allValues, fieldValue)
+
+			// Add primary key values
+			for _, pkField := range primaryKeyFields {
+				field := itemValue.FieldByName(pkField.Name)
+				if !field.IsValid() {
+					return fmt.Errorf("primary key field %s not found in struct", pkField.Name)
+				}
+				allValues = append(allValues, field.Interface())
+			}
+		}
+	}
+
+	if len(allValues) == 0 {
+		return nil
+	}
+
+	return tx.Exec(queryBuilder.String(), allValues...).Error
+}
+
+// useMultipleStatements a flag to enable multiple statements in a single query.  Experimental and has not been tested.
+var useMultipleStatements = false // Set to true if sql_mode has ALLOW_MULTIPLE_STATEMENTS
 
 func batchUpdate[T any](
 	dbProvider DBProvider,
@@ -290,7 +368,7 @@ func batchUpdate[T any](
 		}
 
 		// Replace original slice with deduplicated one
-		allUpdateItems = dedupUpdateItems(allUpdateItems, primaryKeyFields)
+		allUpdateItems = dedupeUpdateItems(allUpdateItems, primaryKeyFields)
 
 		updateFieldsMap := make(map[string]bool)
 		var updateFields []string
@@ -402,7 +480,23 @@ func batchUpdate[T any](
 		}
 
 		var batchErr error
-		if !disableBatchUpdate {
+		if useMultipleStatements {
+			batchErr = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+				return executeUpdatesBatchAsSeparateStatements(
+					tx,
+					tableName,
+					primaryKeyFields,
+					primaryKeyNames,
+					allUpdateItems,
+					mapping)
+			})
+
+			// If batch update succeeds, return success
+			if batchErr == nil {
+				return batcher.RepeatErr(len(batches), nil)
+			}
+
+		} else {
 			// Try batch update first
 			batchErr = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
 				return tx.Exec(queryBuilder.String(), allValues...).Error
@@ -418,15 +512,15 @@ func batchUpdate[T any](
 		var fallbackErrors []error
 		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
 			for _, updateItem := range allUpdateItems {
-				if err := executeIndividualUpdates(
+				if execErr := executeIndividualUpdates(
 					tx,
 					tableName,
 					primaryKeyFields,
 					primaryKeyNames,
 					updateItem,
 					mapping,
-				); err != nil {
-					fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", err))
+				); execErr != nil {
+					fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", execErr))
 				}
 			}
 			if len(fallbackErrors) > 0 {
@@ -444,7 +538,7 @@ func batchUpdate[T any](
 		return batcher.RepeatErr(len(batches), nil)
 	}
 }
-func dedupUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields []reflect.StructField) []UpdateItem[T] {
+func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields []reflect.StructField) []UpdateItem[T] {
 	// Track both the latest values and all fields to update for each ID
 	type combinedUpdate struct {
 		item         T
@@ -953,7 +1047,6 @@ func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation
 
 		// For batch update we do not want to lock all updated rows at once.
 		// Start transaction with READ COMMITTED isolation level to avoid locking all rows.
-		//tx := db.Begin() // Use this to demonstrate "Lock wait timeout exceeded"
 		tx := db.Begin(&sql.TxOptions{
 			Isolation: sql.LevelReadCommitted,
 		})

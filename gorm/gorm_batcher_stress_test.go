@@ -13,7 +13,7 @@ import (
 )
 
 func TestUpdateBatcherStressWithData(t *testing.T) {
-	t.Skip("Skip this test as it is too slow")
+	//t.Skip("Skip this test as it is too slow")
 
 	createNewTable := false
 
@@ -45,17 +45,22 @@ func TestUpdateBatcherStressWithData(t *testing.T) {
 }
 
 func testStressUpdates(t *testing.T, numIDs int) {
-	numRoutines := 100
-	updatesPerRoutine := 100
+	const poolSize = 100
+	numRoutines := 1000
+	updatesPerRoutine := 20
 	var wg sync.WaitGroup
 	var updateErrors int32
 	start := time.Now()
 
+	var batchPool [poolSize]*UpdateBatcher[*TestModel]
 	for r := 0; r < numRoutines; r++ {
 		wg.Add(1)
-		go func(routine int) {
-			batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 10, 100*time.Millisecond, context.Background())
+		if r < poolSize {
+			batcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 50, 100*time.Millisecond, context.Background())
 			assert.NoError(t, err)
+			batchPool[r%poolSize] = batcher
+		}
+		go func(routine int, batcher *UpdateBatcher[*TestModel]) {
 			defer wg.Done()
 
 			updates := make([]*TestModel, 0, 10)
@@ -77,11 +82,13 @@ func testStressUpdates(t *testing.T, numIDs int) {
 				}, updates, []string{"name", "my_value", "updated_at"})
 				updates = updates[:0]
 			}
-		}(r)
+		}(r, batchPool[r%poolSize])
 	}
 
 	wg.Wait()
 	duration := time.Since(start)
+
+	assert.Zero(t, atomic.LoadInt32(&updateErrors))
 
 	t.Logf("Duration: %v", duration)
 	t.Logf("Errors: %d", atomic.LoadInt32(&updateErrors))
