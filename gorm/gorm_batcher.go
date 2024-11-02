@@ -263,7 +263,85 @@ func executeIndividualUpdates[T any](
 	return tx.Exec(queryBuilder.String(), values...).Error
 }
 
-var disableBatchUpdate = false
+func executeUpdatesBatchAsSeparateStatements[T any](
+	tx *gorm.DB,
+	tableName string,
+	primaryKeyFields []reflect.StructField,
+	primaryKeyNames []string,
+	updateItems []UpdateItem[T],
+	mapping fieldMapping,
+) error {
+	var queryBuilder strings.Builder
+	var allValues []interface{}
+
+	for itemIndex, updateItem := range updateItems {
+		itemValue := reflect.ValueOf(updateItem.Item)
+		if itemValue.Kind() == reflect.Ptr {
+			itemValue = itemValue.Elem()
+		}
+		itemType := itemValue.Type()
+
+		fieldsToUpdate := updateItem.UpdateFields
+		if len(fieldsToUpdate) == 0 {
+			// Update all fields except the primary key
+			for i := 0; i < itemType.NumField(); i++ {
+				field := itemType.Field(i)
+				if !isPrimaryKey(field) {
+					fieldsToUpdate = append(fieldsToUpdate, field.Name)
+				}
+			}
+		}
+
+		_, updatedAtExists := itemType.FieldByName("UpdatedAt")
+		if updatedAtExists && !contains(fieldsToUpdate, "UpdatedAt") && !contains(fieldsToUpdate, "updated_at") {
+			fieldsToUpdate = append(fieldsToUpdate, "UpdatedAt")
+		}
+
+		for i, fieldName := range fieldsToUpdate {
+			if itemIndex > 0 || i > 0 {
+				queryBuilder.WriteString("; ")
+			}
+
+			structFieldName, dbFieldName, err := getFieldNames(fieldName, mapping)
+			if err != nil {
+				return err
+			}
+
+			queryBuilder.WriteString(fmt.Sprintf("UPDATE %s SET %s = ? WHERE (", tableName, dbFieldName))
+			queryBuilder.WriteString(strings.Join(primaryKeyNames, ", "))
+			queryBuilder.WriteString(") = (")
+			queryBuilder.WriteString(strings.Repeat("?,", len(primaryKeyNames)-1) + "?")
+			queryBuilder.WriteString(")")
+
+			// Add the value to update
+			var fieldValue interface{}
+			if fieldName == "UpdatedAt" {
+				fieldValue = time.Now()
+			} else {
+				fieldValue = itemValue.FieldByName(structFieldName).Interface()
+			}
+			allValues = append(allValues, fieldValue)
+
+			// Add primary key values
+			for _, pkField := range primaryKeyFields {
+				field := itemValue.FieldByName(pkField.Name)
+				if !field.IsValid() {
+					return fmt.Errorf("primary key field %s not found in struct", pkField.Name)
+				}
+				allValues = append(allValues, field.Interface())
+			}
+		}
+	}
+
+	if len(allValues) == 0 {
+		return nil
+	}
+
+	return tx.Exec(queryBuilder.String(), allValues...).Error
+}
+
+// useMultipleStatements a flag to enable multiple statements in a single query.  Experimental and has not been tested.
+var useMultipleStatements = false // Set to true if sql_mode has ALLOW_MULTIPLE_STATEMENTS
 
 func batchUpdate[T any](
 	dbProvider DBProvider,
@@ -289,59 +367,8 @@ func batchUpdate[T any](
 			return batcher.RepeatErr(len(batches), err)
 		}
 
-		// Track both the latest values and all fields to update for each ID
-		type combinedUpdate struct {
-			item         T
-			updateFields map[string]bool
-		}
-		latestUpdates := make(map[string]combinedUpdate)
-
-		for _, updateItem := range allUpdateItems {
-			item := updateItem.Item
-			itemValue := reflect.ValueOf(item)
-			if itemValue.Kind() == reflect.Ptr {
-				itemValue = itemValue.Elem()
-			}
-
-			// Create composite key for the item
-			var keyParts []string
-			for _, pkField := range primaryKeyFields {
-				keyParts = append(keyParts, fmt.Sprint(itemValue.FieldByName(pkField.Name).Interface()))
-			}
-			compositeKey := strings.Join(keyParts, "-")
-
-			// Get or create the combined update
-			combined, exists := latestUpdates[compositeKey]
-			if !exists {
-				combined = combinedUpdate{
-					item:         item,
-					updateFields: make(map[string]bool),
-				}
-			}
-			// Keep the latest value
-			combined.item = item
-			// Merge the fields to update
-			for _, field := range updateItem.UpdateFields {
-				combined.updateFields[field] = true
-			}
-			latestUpdates[compositeKey] = combined
-		}
-
-		// Convert back to UpdateItems
-		deduplicatedItems := make([]UpdateItem[T], 0, len(latestUpdates))
-		for _, combined := range latestUpdates {
-			fields := make([]string, 0, len(combined.updateFields))
-			for field := range combined.updateFields {
-				fields = append(fields, field)
-			}
-			deduplicatedItems = append(deduplicatedItems, UpdateItem[T]{
-				Item:         combined.item,
-				UpdateFields: fields,
-			})
-		}
-
 		// Replace original slice with deduplicated one
-		allUpdateItems = deduplicatedItems
+		allUpdateItems = dedupeUpdateItems(allUpdateItems, primaryKeyFields)
 
 		updateFieldsMap := make(map[string]bool)
 		var updateFields []string
@@ -425,21 +452,51 @@ func batchUpdate[T any](
 			allValues = append(allValues, valuesPerField[field]...)
 		}
 
-		queryBuilder.WriteString(" WHERE ")
-		for i, pkName := range primaryKeyNames {
-			if i > 0 {
-				queryBuilder.WriteString(" AND ")
-			}
-			queryBuilder.WriteString(fmt.Sprintf("%s IN (?)", pkName))
-		}
+		queryBuilder.WriteString(" WHERE (")
+		queryBuilder.WriteString(strings.Join(primaryKeyNames, ", "))
+		queryBuilder.WriteString(") IN (")
 
-		for _, pkField := range primaryKeyFields {
-			pkValues := getPrimaryKeyValues(allUpdateItems, pkField.Name)
-			allValues = append(allValues, pkValues)
+		var placeholders []string
+		for range allUpdateItems {
+			placeholders = append(placeholders, "("+strings.Repeat("?,", len(primaryKeyNames)-1)+"?)")
+		}
+		queryBuilder.WriteString(strings.Join(placeholders, ", "))
+		queryBuilder.WriteString(")")
+
+		// Create tuples of composite key values
+		for _, updateItem := range allUpdateItems {
+			itemValue := reflect.ValueOf(updateItem.Item)
+			if itemValue.Kind() == reflect.Ptr {
+				itemValue = itemValue.Elem()
+			}
+
+			for _, pkField := range primaryKeyFields {
+				field := itemValue.FieldByName(pkField.Name)
+				if !field.IsValid() {
+					return batcher.RepeatErr(len(batches), fmt.Errorf("primary key field %s not found in struct", pkField.Name))
+				}
+				allValues = append(allValues, field.Interface())
+			}
 		}
 
 		var batchErr error
-		if !disableBatchUpdate {
+		if useMultipleStatements {
+			batchErr = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+				return executeUpdatesBatchAsSeparateStatements(
+					tx,
+					tableName,
+					primaryKeyFields,
+					primaryKeyNames,
+					allUpdateItems,
+					mapping)
+			})
+
+			// If batch update succeeds, return success
+			if batchErr == nil {
+				return batcher.RepeatErr(len(batches), nil)
+			}
+
+		} else {
 			// Try batch update first
 			batchErr = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
 				return tx.Exec(queryBuilder.String(), allValues...).Error
@@ -455,15 +512,15 @@ func batchUpdate[T any](
 		var fallbackErrors []error
 		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
 			for _, updateItem := range allUpdateItems {
-				if err := executeIndividualUpdates(
+				if execErr := executeIndividualUpdates(
 					tx,
 					tableName,
 					primaryKeyFields,
 					primaryKeyNames,
 					updateItem,
 					mapping,
-				); err != nil {
-					fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", err))
+				); execErr != nil {
+					fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", execErr))
 				}
 			}
 			if len(fallbackErrors) > 0 {
@@ -480,6 +537,59 @@ func batchUpdate[T any](
 		// Individual updates succeeded
 		return batcher.RepeatErr(len(batches), nil)
 	}
+}
+func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields []reflect.StructField) []UpdateItem[T] {
+	// Track both the latest values and all fields to update for each ID
+	type combinedUpdate struct {
+		item         T
+		updateFields map[string]bool
+	}
+	latestUpdates := make(map[string]combinedUpdate)
+
+	for _, updateItem := range allUpdateItems {
+		item := updateItem.Item
+		itemValue := reflect.ValueOf(item)
+		if itemValue.Kind() == reflect.Ptr {
+			itemValue = itemValue.Elem()
+		}
+
+		// Create composite key for the item
+		var keyParts []string
+		for _, pkField := range primaryKeyFields {
+			keyParts = append(keyParts, fmt.Sprint(itemValue.FieldByName(pkField.Name).Interface()))
+		}
+		compositeKey := strings.Join(keyParts, "-")
+
+		// Get or create the combined update
+		combined, exists := latestUpdates[compositeKey]
+		if !exists {
+			combined = combinedUpdate{
+				item:         item,
+				updateFields: make(map[string]bool),
+			}
+		}
+		// Keep the latest value
+		combined.item = item
+		// Merge the fields to update
+		for _, field := range updateItem.UpdateFields {
+			combined.updateFields[field] = true
+		}
+		latestUpdates[compositeKey] = combined
+	}
+
+	// Convert back to UpdateItems
+	deduplicatedItems := make([]UpdateItem[T], 0, len(latestUpdates))
+	for _, combined := range latestUpdates {
+		fields := make([]string, 0, len(combined.updateFields))
+		for field := range combined.updateFields {
+			fields = append(fields, field)
+		}
+		deduplicatedItems = append(deduplicatedItems, UpdateItem[T]{
+			Item:         combined.item,
+			UpdateFields: fields,
+		})
+	}
+	return deduplicatedItems
 }
 
 func isDeadlockError(err error) bool {
@@ -935,35 +1045,58 @@ func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation
 			return fmt.Errorf("failed to get database connection: %w", err)
 		}
 
-		// Wrap everything in a transaction to ensure proper cleanup
-		err = db.Transaction(func(tx *gorm.DB) error {
-			// Create session within transaction
-			sessionDB := tx.Session(&gorm.Session{})
-
-			if db.Dialector.Name() == "mysql" {
-				// Set timeout for this session
-				if timeoutSetErr := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = 1").Error; timeoutSetErr != nil {
-					return fmt.Errorf("failed to set session timeout: %w", timeoutSetErr)
-				}
-			}
-
-			// Execute the operation
-			return operation(sessionDB)
+		// For batch update we do not want to lock all updated rows at once.
+		// Start transaction with READ COMMITTED isolation level to avoid locking all rows.
+		tx := db.Begin(&sql.TxOptions{
+			Isolation: sql.LevelReadCommitted,
 		})
-
-		if err == nil {
-			return nil
+		if tx.Error != nil {
+			return fmt.Errorf("failed to begin transaction: %w", tx.Error)
 		}
 
-		if !isDeadlockError(err) {
-			return fmt.Errorf("operation failed: %w", err)
+		// Create a session within transaction to avoid updating the global session
+		sessionDB := tx.Session(&gorm.Session{})
+
+		if db.Dialector.Name() == "mysql" {
+			// Set lock wait timeout for this session
+			if timeoutSetErr := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = 1").Error; timeoutSetErr != nil {
+				sessionDB.Rollback()
+				return fmt.Errorf("failed to set session timeout: %w", timeoutSetErr)
+			}
 		}
 
-		fmt.Printf("Error detected (retrying): %v\n", err)
-		delay := baseDelay * time.Duration(1<<uint(attempt)) * time.Duration(1+rand.Intn(100)) / 100
-		time.Sleep(delay)
-		lastErr = err
+		// Execute the operation
+		err = operation(sessionDB)
+		if err != nil {
+			sessionDB.Rollback()
+			if !isDeadlockError(err) {
+				return fmt.Errorf("operation failed: %w", err)
+			}
+			fmt.Printf("Error detected (retrying): %v\n", err)
+			delayNextAttempt(attempt)
+			lastErr = err
+			continue
+		}
+
+		// Commit the transaction
+		if err = sessionDB.Commit().Error; err != nil {
+			sessionDB.Rollback()
+			if !isDeadlockError(err) {
+				return fmt.Errorf("failed to commit transaction: %w", err)
+			}
+			fmt.Printf("Error detected during commit (retrying): %v\n", err)
+			delayNextAttempt(attempt)
+			lastErr = err
+			continue
+		}
+
+		return nil
 	}
 
 	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr)
+}
+
+func delayNextAttempt(attempt int) {
+	delay := baseDelay * time.Duration(1<<uint(attempt)) * time.Duration(1+rand.Intn(100)) / 100
+	time.Sleep(delay)
 }

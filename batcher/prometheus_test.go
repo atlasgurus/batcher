@@ -58,7 +58,7 @@ batcher_batches_processed_total{processor="test_processor"} 2
 batcher_items_processed_total{processor="test_processor"} 5
 # HELP batcher_errors_total The total number of errors encountered during batch processing
 # TYPE batcher_errors_total counter
-batcher_errors_total{processor="test_processor"} 2
+batcher_errors_total{error="odd number",processor="test_processor"} 2
 `
 
 	if err := testutil.CollectAndCompare(collector.batchesProcessed, strings.NewReader(expectedOutput), "batcher_batches_processed_total"); err != nil {

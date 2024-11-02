@@ -155,10 +155,10 @@ func (bp *BatchProcessor[T]) run() {
 
 		// Collect metrics after processing the batch
 		if bp.config.MetricsCollector != nil {
-			errorCount := 0
+			errorCount := make(map[string]int64)
 			for _, err := range errs {
 				if err != nil {
-					errorCount++
+					errorCount[err.Error()]++
 				}
 			}
 
@@ -166,7 +166,7 @@ func (bp *BatchProcessor[T]) run() {
 				BatchesProcessed:    1,
 				ItemsProcessed:      int64(len(batch)),
 				TotalProcessingTime: time.Since(startTime),
-				Errors:              int64(errorCount),
+				Errors:              errorCount,
 			})
 		}
 		batch = nil
@@ -211,5 +211,5 @@ type BatchMetrics struct {
 	BatchesProcessed    int64
 	ItemsProcessed      int64
 	TotalProcessingTime time.Duration
-	Errors              int64
+	Errors              map[string]int64
 }

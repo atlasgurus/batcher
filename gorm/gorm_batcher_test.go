@@ -86,7 +86,7 @@ func TestMain(m *testing.M) {
 
 func getDBProvider() DBProvider {
 	return func() (*gormv2.DB, error) {
-		return db, nil
+		return db.Debug(), nil
 	}
 }
 
@@ -507,17 +507,32 @@ func TestUpdateBatcher_CompositeKey(t *testing.T) {
 		{ID1: 1, ID2: "A", Name: "Test 1", MyValue: 10},
 		{ID1: 1, ID2: "B", Name: "Test 2", MyValue: 20},
 		{ID1: 2, ID2: "A", Name: "Test 3", MyValue: 30},
+		// Add cases that would fail with imprecise comparison
+		{ID1: 2, ID2: "B", Name: "Test 4", MyValue: 40},
+		{ID1: 3, ID2: "A", Name: "Test 5", MyValue: 50},
 	}
 	db.Create(&initialModels)
 
-	updatedModels := make([]*CompositeKeyModel, len(initialModels))
-	for i := range initialModels {
-		updatedModels[i] = &CompositeKeyModel{
-			ID1:     initialModels[i].ID1,
-			ID2:     initialModels[i].ID2,
-			Name:    fmt.Sprintf("Updated %d", i+1),
-			MyValue: initialModels[i].MyValue + 5,
-		}
+	// Create updates that would incorrectly modify data if using IN clause per column
+	updatedModels := []*CompositeKeyModel{
+		{
+			ID1:     1,
+			ID2:     "A",
+			Name:    "Updated 1",
+			MyValue: 15,
+		},
+		{
+			ID1:     2,
+			ID2:     "B",
+			Name:    "Updated 4",
+			MyValue: 45,
+		},
+		{
+			ID1:     3,
+			ID2:     "A",
+			Name:    "Updated 5",
+			MyValue: 55,
+		},
 	}
 
 	err = batcher.Update(updatedModels, []string{"Name", "MyValue"})
@@ -525,13 +540,33 @@ func TestUpdateBatcher_CompositeKey(t *testing.T) {
 
 	var finalModels []CompositeKeyModel
 	db.Order("id1 asc, id2 asc").Find(&finalModels)
-	assert.Len(t, finalModels, 3)
+	assert.Len(t, finalModels, 5)
 
-	for i, model := range finalModels {
-		assert.Equal(t, fmt.Sprintf("Updated %d", i+1), model.Name)
-		assert.Equal(t, initialModels[i].MyValue+5, model.MyValue)
-		assert.Equal(t, initialModels[i].ID1, model.ID1)
-		assert.Equal(t, initialModels[i].ID2, model.ID2)
+	// Records that should be updated
+	expectedUpdates := map[string]CompositeKeyModel{
+		"1|A": {ID1: 1, ID2: "A", Name: "Updated 1", MyValue: 15},
+		"2|B": {ID1: 2, ID2: "B", Name: "Updated 4", MyValue: 45},
+		"3|A": {ID1: 2, ID2: "A", Name: "Updated 5", MyValue: 55},
+	}
+
+	// Records that should remain unchanged
+	expectedUnchanged := map[string]CompositeKeyModel{
+		"1|B": {ID1: 1, ID2: "B", Name: "Test 2", MyValue: 20},
+		"2|A": {ID1: 2, ID2: "A", Name: "Test 3", MyValue: 30},
+	}
+
+	for _, model := range finalModels {
+		key := fmt.Sprintf("%d|%s", model.ID1, model.ID2)
+
+		if expected, ok := expectedUpdates[key]; ok {
+			assert.Equal(t, expected.Name, model.Name, "Updated record mismatch for key %s", key)
+			assert.Equal(t, expected.MyValue, model.MyValue, "Updated record mismatch for key %s", key)
+		} else if expected, ok := expectedUnchanged[key]; ok {
+			assert.Equal(t, expected.Name, model.Name, "Unchanged record was modified for key %s", key)
+			assert.Equal(t, expected.MyValue, model.MyValue, "Unchanged record was modified for key %s", key)
+		} else {
+			assert.Fail(t, "Unexpected record found", "Key: %s", key)
+		}
 	}
 }
 

@@ -45,7 +45,7 @@ func NewPrometheusMetricsCollector(processorName string) *PrometheusMetricsColle
 				Help:        "The total number of errors encountered during batch processing",
 				ConstLabels: prometheus.Labels{"processor": processorName},
 			},
-			[]string{},
+			[]string{"error"},
 		),
 	}
 }
@@ -54,5 +54,7 @@ func (p *PrometheusMetricsCollector) Collect(metrics BatchMetrics) {
 	p.batchesProcessed.WithLabelValues().Add(float64(metrics.BatchesProcessed))
 	p.itemsProcessed.WithLabelValues().Add(float64(metrics.ItemsProcessed))
 	p.processingDuration.WithLabelValues().Observe(metrics.TotalProcessingTime.Seconds())
-	p.errors.WithLabelValues().Add(float64(metrics.Errors))
+	for err, count := range metrics.Errors {
+		p.errors.WithLabelValues(err).Add(float64(count))
+	}
 }
