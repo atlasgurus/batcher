@@ -510,28 +510,24 @@ func batchUpdate[T any](
 
 		// If batch update fails, try individual updates
 		var fallbackErrors []error
-		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
-			for _, updateItem := range allUpdateItems {
-				if execErr := executeIndividualUpdates(
+		for _, updateItem := range allUpdateItems {
+			if retryErr := retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+				return executeIndividualUpdates(
 					tx,
 					tableName,
 					primaryKeyFields,
 					primaryKeyNames,
 					updateItem,
 					mapping,
-				); execErr != nil {
-					fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", execErr))
-				}
+				)
+			}); retryErr != nil {
+				fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", retryErr))
 			}
-			if len(fallbackErrors) > 0 {
-				return fmt.Errorf("%d individual updates failed: (%v)", len(fallbackErrors), fallbackErrors)
-			}
-			return nil
-		})
-
-		if err != nil {
+		}
+		if len(fallbackErrors) > 0 {
 			// Both batch and individual updates failed
-			return batcher.RepeatErr(len(batches), fmt.Errorf("batch update failed: %v, individual updates failed: %v", batchErr, err))
+			fallbackErr := fmt.Errorf("%d individual updates failed: (%v)", len(fallbackErrors), fallbackErrors)
+			return batcher.RepeatErr(len(batches), fmt.Errorf("batch update failed: %v, individual updates failed: %v", batchErr, fallbackErr))
 		}
 
 		// Individual updates succeeded
