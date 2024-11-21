@@ -577,3 +577,34 @@ func TestMemoizeWithIgnoreParams(t *testing.T) {
 		t.Errorf("All-ignore: Expected 5 calls, got %d", calls)
 	}
 }
+
+func TestMemoizeWithNoParameters(t *testing.T) {
+	calls := 0
+	f := func() int {
+		calls++
+		return 42
+	}
+
+	memoized := Memoize(f)
+
+	for i := 0; i < 3; i++ {
+		result := memoized()
+		if result != 42 {
+			t.Errorf("Expected 42, got %d", result)
+		}
+	}
+
+	if calls != 1 {
+		t.Errorf("Expected 1 call, got %d", calls)
+	}
+
+	// Test with expiration
+	memoizedWithExpiration := Memoize(f, WithExpiration(50*time.Millisecond))
+	memoizedWithExpiration()
+	time.Sleep(100 * time.Millisecond)
+	memoizedWithExpiration()
+
+	if calls != 3 {
+		t.Errorf("Expected 3 calls (1 from first test, 2 from expiration test), got %d", calls)
+	}
+}
