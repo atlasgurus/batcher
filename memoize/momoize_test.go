@@ -608,3 +608,70 @@ func TestMemoizeWithNoParameters(t *testing.T) {
 		t.Errorf("Expected 3 calls (1 from first test, 2 from expiration test), got %d", calls)
 	}
 }
+
+func TestMemoizeWithSingleIgnoredParameter(t *testing.T) {
+	calls := 0
+	f := func(x int) string {
+		calls++
+		return "constant result"
+	}
+
+	memoized := Memoize(f, WithIgnoreParams([]int{0})) // Ignore the only parameter
+
+	testCases := []struct {
+		name      string
+		input     int
+		expected  string
+		wantCalls int
+	}{
+		{"First call", 1, "constant result", 1},
+		{"Different value", 2, "constant result", 1},
+		{"Large value", 1000, "constant result", 1},
+		{"Negative value", -1, "constant result", 1},
+		{"Zero value", 0, "constant result", 1},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := memoized(tc.input)
+			if result != tc.expected {
+				t.Errorf("Expected result %s, got %s", tc.expected, result)
+			}
+			if calls != tc.wantCalls {
+				t.Errorf("Expected %d calls, got %d", tc.wantCalls, calls)
+			}
+		})
+	}
+
+	// Test with concurrent access
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(val int) {
+			defer wg.Done()
+			result := memoized(val)
+			if result != "constant result" {
+				t.Errorf("Concurrent call: Expected 'constant result', got %s", result)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Verify total calls remained at 1 despite concurrent access with different values
+	if calls != 1 {
+		t.Errorf("After concurrent execution: Expected 1 total call, got %d", calls)
+	}
+
+	// Test with expiration
+	memoizedWithExpiration := Memoize(f,
+		WithIgnoreParams([]int{0}),
+		WithExpiration(50*time.Millisecond))
+
+	memoizedWithExpiration(1)
+	time.Sleep(100 * time.Millisecond)
+	memoizedWithExpiration(2) // Different value after expiration
+
+	if calls != 3 { // 1 from first tests + 2 from expiration test
+		t.Errorf("After expiration test: Expected 3 total calls, got %d", calls)
+	}
+}
