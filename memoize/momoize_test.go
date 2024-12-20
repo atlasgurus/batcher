@@ -120,7 +120,7 @@ func TestMemoizeWithErrorReturn(t *testing.T) {
 		return x * 2, nil
 	}
 
-	memoized := Memoize(f)
+	memoized := Memoize(f, WithMemoizeErrors(true))
 
 	// Test successful case
 	result, err := memoized(5)
@@ -161,7 +161,7 @@ func TestMemoizeWithMultipleReturnsAndError(t *testing.T) {
 
 	memoized := Memoize(f)
 
-	// Test successful case
+	// Test successful case (should be memoized)
 	sum, product, err := memoized(3, 4)
 	if err != nil || sum != 7 || product != 12 {
 		t.Errorf("Expected (7, 12, nil), got (%d, %d, %v)", sum, product, err)
@@ -172,14 +172,19 @@ func TestMemoizeWithMultipleReturnsAndError(t *testing.T) {
 		t.Errorf("Expected (7, 12, nil), got (%d, %d, %v)", sum, product, err)
 	}
 
-	// Test error case
+	// Test error case (should not be memoized by default)
 	sum, product, err = memoized(-1, 4)
 	if err == nil || err.Error() != "negative input" || sum != 0 || product != 0 {
 		t.Errorf("Expected (0, 0, 'negative input'), got (%d, %d, %v)", sum, product, err)
 	}
 
-	if calls != 2 {
-		t.Errorf("Expected 2 calls, got %d", calls)
+	sum, product, err = memoized(-1, 4)
+	if err == nil || err.Error() != "negative input" || sum != 0 || product != 0 {
+		t.Errorf("Expected (0, 0, 'negative input'), got (%d, %d, %v)", sum, product, err)
+	}
+
+	if calls != 3 { // One call for success case (memoized) and two calls for error case (not memoized)
+		t.Errorf("Expected 3 calls, got %d", calls)
 	}
 }
 
@@ -350,15 +355,15 @@ func TestMemoizeWithPointerArguments(t *testing.T) {
 		t.Errorf("Expected cached result 'database1' and still 1 call, got %s and %d calls", result2, calls)
 	}
 
-	// Call with db2 (different pointer, same content - should not hit cache)
+	// Call with db2 (different pointer, same content - should still hit cache)
 	result3 := memoized(db2)
-	if result3 != "database1" || calls != 2 {
+	if result3 != "database1" || calls != 1 {
 		t.Errorf("Expected new result 'database1' and 2 calls, got %s and %d calls", result3, calls)
 	}
 
 	// Call with db3 (different content)
 	result4 := memoized(db3)
-	if result4 != "database2" || calls != 3 {
+	if result4 != "database2" || calls != 2 {
 		t.Errorf("Expected result 'database2' and 3 calls, got %s and %d calls", result4, calls)
 	}
 }
@@ -389,27 +394,28 @@ func TestMemoizeWithContext(t *testing.T) {
 	memoFunc3 := Memoize(func3, WithMaxSize(100), WithExpiration(time.Minute))
 
 	ctx1 := context.Background()
-	ctx2 := context.WithValue(context.Background(), "key", "value")
+	ctx2 := context.WithValue(context.Background(), "key", &ctx1)
 
 	// Test cases
 	testCases := []struct {
-		name     string
-		memoFunc interface{}
-		args     []interface{}
-		expected string
-		calls    *int
+		name       string
+		memoFunc   interface{}
+		args       []interface{}
+		expected   string
+		calls      *int
+		expectCall bool
 	}{
-		{"Func1 First Call", memoFunc1, []interface{}{ctx1, 1, "a"}, "1-a", &func1Calls},
-		{"Func1 Same Args Different Context", memoFunc1, []interface{}{ctx2, 1, "a"}, "1-a", &func1Calls},
-		{"Func1 Different Args", memoFunc1, []interface{}{ctx1, 2, "a"}, "2-a", &func1Calls},
+		{"Func1 First Call", memoFunc1, []interface{}{ctx1, 1, "a"}, "1-a", &func1Calls, true},
+		{"Func1 Same Args Different Context", memoFunc1, []interface{}{ctx2, 1, "a"}, "1-a", &func1Calls, true},
+		{"Func1 Different Args", memoFunc1, []interface{}{ctx1, 3, "a"}, "3-a", &func1Calls, true},
 
-		{"Func2 First Call", memoFunc2, []interface{}{1, ctx1, "a"}, "1-a", &func2Calls},
-		{"Func2 Same Args Different Context", memoFunc2, []interface{}{1, ctx2, "a"}, "1-a", &func2Calls},
-		{"Func2 Different Args", memoFunc2, []interface{}{2, ctx1, "a"}, "2-a", &func2Calls},
+		{"Func2 First Call", memoFunc2, []interface{}{1, ctx1, "a"}, "1-a", &func2Calls, true},
+		{"Func2 Same Args Different Context", memoFunc2, []interface{}{2, ctx2, "a"}, "2-a", &func2Calls, true},
+		{"Func2 Different Args", memoFunc2, []interface{}{3, ctx1, "a"}, "3-a", &func2Calls, true},
 
-		{"Func3 First Call", memoFunc3, []interface{}{1, "a", ctx1}, "1-a", &func3Calls},
-		{"Func3 Same Args Different Context", memoFunc3, []interface{}{1, "a", ctx2}, "1-a", &func3Calls},
-		{"Func3 Different Args", memoFunc3, []interface{}{2, "a", ctx1}, "2-a", &func3Calls},
+		{"Func3 First Call", memoFunc3, []interface{}{1, "a", ctx1}, "1-a", &func3Calls, true},
+		{"Func3 Same Args Different Context", memoFunc3, []interface{}{2, "a", ctx2}, "2-a", &func3Calls, true},
+		{"Func3 Different Args", memoFunc3, []interface{}{2, "b", ctx1}, "2-b", &func3Calls, true},
 	}
 
 	for _, tc := range testCases {
@@ -430,8 +436,7 @@ func TestMemoizeWithContext(t *testing.T) {
 			}
 
 			expectedCalls := initialCalls
-			if tc.name == "Func1 First Call" || tc.name == "Func2 First Call" || tc.name == "Func3 First Call" ||
-				tc.name == "Func1 Different Args" || tc.name == "Func2 Different Args" || tc.name == "Func3 Different Args" {
+			if tc.expectCall {
 				expectedCalls++
 			}
 
@@ -575,5 +580,70 @@ func TestMemoizeWithIgnoreParams(t *testing.T) {
 	}
 	if calls != 5 { // 4 from previous tests + 1 for this new call
 		t.Errorf("All-ignore: Expected 5 calls, got %d", calls)
+	}
+}
+
+func TestMemoizeErrorHandling(t *testing.T) {
+	calls := 0
+	f := func(x int) (int, error) {
+		calls++
+		if x < 0 {
+			return 0, errors.New("negative input")
+		}
+		return x * 2, nil
+	}
+
+	// Test default behavior (don't memoize errors)
+	defaultMemoized := Memoize(f)
+
+	// First call with error
+	result, err := defaultMemoized(-1)
+	if err == nil || err.Error() != "negative input" || result != 0 {
+		t.Errorf("Expected (0, 'negative input'), got (%d, %v)", result, err)
+	}
+
+	// Second call with same input (should retry due to error)
+	result, err = defaultMemoized(-1)
+	if err == nil || err.Error() != "negative input" || result != 0 {
+		t.Errorf("Expected (0, 'negative input'), got (%d, %v)", result, err)
+	}
+
+	if calls != 2 {
+		t.Errorf("Expected 2 calls (no error memoization), got %d", calls)
+	}
+
+	// Test with error memoization enabled
+	calls = 0
+	memoizedWithErrors := Memoize(f, WithMemoizeErrors(true))
+
+	// First call with error
+	result, err = memoizedWithErrors(-1)
+	if err == nil || err.Error() != "negative input" || result != 0 {
+		t.Errorf("Expected (0, 'negative input'), got (%d, %v)", result, err)
+	}
+
+	// Second call with same input (should use memoized error)
+	result, err = memoizedWithErrors(-1)
+	if err == nil || err.Error() != "negative input" || result != 0 {
+		t.Errorf("Expected (0, 'negative input'), got (%d, %v)", result, err)
+	}
+
+	if calls != 1 {
+		t.Errorf("Expected 1 call (with error memoization), got %d", calls)
+	}
+
+	// Test successful case (should still be memoized)
+	result, err = memoizedWithErrors(5)
+	if err != nil || result != 10 {
+		t.Errorf("Expected (10, nil), got (%d, %v)", result, err)
+	}
+
+	result, err = memoizedWithErrors(5)
+	if err != nil || result != 10 {
+		t.Errorf("Expected (10, nil), got (%d, %v)", result, err)
+	}
+
+	if calls != 2 {
+		t.Errorf("Expected 2 calls total, got %d", calls)
 	}
 }

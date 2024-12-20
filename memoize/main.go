@@ -2,7 +2,6 @@ package memoize
 
 import (
 	"container/list"
-	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -23,10 +22,11 @@ type cacheEntry struct {
 type Option func(*memoizeOptions)
 
 type memoizeOptions struct {
-	maxSize      int
-	expiration   time.Duration
-	metrics      MetricsCollector
-	ignoreParams []int
+	maxSize       int
+	expiration    time.Duration
+	metrics       MetricsCollector
+	ignoreParams  []int
+	memoizeErrors bool
 }
 
 func WithMaxSize(size int) Option {
@@ -44,6 +44,12 @@ func WithExpiration(d time.Duration) Option {
 func WithIgnoreParams(indices []int) Option {
 	return func(o *memoizeOptions) {
 		o.ignoreParams = indices
+	}
+}
+
+func WithMemoizeErrors(memoize bool) Option {
+	return func(o *memoizeOptions) {
+		o.memoizeErrors = memoize
 	}
 }
 
@@ -87,6 +93,13 @@ func Memoize[F any](f F, options ...Option) F {
 
 	if opts.metrics != nil {
 		opts.metrics.Setup(f)
+	}
+
+	// Pre-compute whether the function returns an error as its last value
+	hasErrorReturn := false
+	if ft.NumOut() > 0 {
+		lastReturn := ft.Out(ft.NumOut() - 1)
+		hasErrorReturn = lastReturn.Implements(reflect.TypeOf((*error)(nil)).Elem())
 	}
 
 	cleanup := func() {
@@ -144,12 +157,27 @@ func Memoize[F any](f F, options ...Option) F {
 		// Compute the result
 		result := reflect.ValueOf(f).Call(args)
 
-		mutex.Lock()
-		entry.result = result
-		entry.computing = false
-		cleanup()          // Clean up after adding new entry
-		close(entry.ready) // Signal that the result is ready
-		mutex.Unlock()
+		// Check if result has error and if we should skip memoization
+		shouldMemoize := true
+		if hasErrorReturn && !opts.memoizeErrors {
+			if !result[len(result)-1].IsNil() {
+				shouldMemoize = false
+			}
+		}
+
+		if shouldMemoize {
+			mutex.Lock()
+			entry.result = result
+			entry.computing = false
+			cleanup()          // Clean up after adding new entry
+			close(entry.ready) // Signal that the result is ready
+			mutex.Unlock()
+		} else {
+			mutex.Lock()
+			delete(cache, key)
+			lru.Remove(element)
+			mutex.Unlock()
+		}
 
 		metrics.Misses.Add(1)
 		return result
@@ -165,63 +193,14 @@ func makeKey(args []reflect.Value, ignoreParams []int) string {
 			if key.Len() > 0 {
 				key.WriteString(",")
 			}
-			if true {
-				key.WriteString(makeShallowKey(arg))
-			} else {
-				key.WriteString(makeDeepKey(arg))
-			}
+			key.WriteString(makeOneKey(arg))
 		}
 	}
 	return key.String()
 }
 
-// in case we want to start using a deep key
-func makeDeepKey(v reflect.Value) string {
-	var key string
-	switch v.Kind() {
-	case reflect.Array, reflect.Slice, reflect.Map, reflect.Struct:
-		// Use a string representation for complex types
-		key += fmt.Sprintf("%#v", v.Interface())
-	default:
-		// Use the value directly for simple types
-		key += fmt.Sprintf("%v", v.Interface())
-	}
-	return key
-}
-
-func makeShallowKey(v reflect.Value) string {
-	// Special handling for context.Context
-	if v.Type().Implements(reflect.TypeOf((*context.Context)(nil)).Elem()) {
-		return "context" // We return a constant string for all contexts
-	}
-	switch v.Kind() {
-	case reflect.Ptr:
-		if v.IsNil() {
-			return "nil"
-		}
-		return fmt.Sprintf("ptr(%p):%s", v.Interface(), makeShallowKey(v.Elem()))
-	case reflect.Struct:
-		var fieldKeys []string
-		t := v.Type()
-		for i := 0; i < v.NumField(); i++ {
-			if t.Field(i).IsExported() {
-				field := v.Field(i)
-				fieldKeys = append(fieldKeys, fmt.Sprintf("%s:%s", t.Field(i).Name, makeShallowKey(field)))
-			}
-		}
-		return fmt.Sprintf("%s{%s}", v.Type().Name(), strings.Join(fieldKeys, ","))
-	case reflect.Slice:
-		var elemKeys []string
-		for i := 0; i < v.Len(); i++ {
-			elemKeys = append(elemKeys, fmt.Sprintf("%v", v.Index(i).Interface()))
-		}
-		return fmt.Sprintf("%s[%s]", v.Type().Name(), strings.Join(elemKeys, ","))
-	case reflect.Map:
-		// For maps, we still use length and address to avoid deep comparison
-		return fmt.Sprintf("%s(len=%d,addr=%p)", v.Type().Name(), v.Len(), v.Interface())
-	default:
-		return fmt.Sprintf("%v", v.Interface())
-	}
+func makeOneKey(v reflect.Value) string {
+	return fmt.Sprintf("%#v", v.Interface())
 }
 
 func contains(slice []int, item int) bool {
