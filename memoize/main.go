@@ -71,7 +71,27 @@ func WithMetrics(collector MetricsCollector) Option {
 	}
 }
 
-func Memoize[F any](f F, options ...Option) F {
+// MemoizeWithInvalidate wraps a function with a caching layer that stores and reuses computed results.
+// It returns two values:
+//   - A memoized version of the input function with identical signature
+//   - An invalidation function that clears the cache when called
+//
+// The memoized function caches results based on the string representation of input arguments.
+// Cache entries expire based on time and size limits set via options.
+//
+// Options:
+//   - WithMaxSize: Sets maximum number of cached results (default 100)
+//   - WithExpiration: Sets how long cached results remain valid (default 1 hour)
+//   - WithIgnoreParams: Specifies argument indices to exclude from cache key
+//   - WithMemoizeErrors: Controls whether error results are cached (default false)
+//   - WithMetrics: Provides a collector for cache performance metrics
+//
+// Example:
+//
+//	memoizedFn, invalidate := Memoize(expensiveFunc, WithMaxSize(1000))
+//	result := memoizedFn(arg) // Result is computed and cached
+//	invalidate() // Clears the cache
+func MemoizeWithInvalidate[F any](f F, options ...Option) (F, func()) {
 	ft := reflect.TypeOf(f)
 	if ft.Kind() != reflect.Func {
 		panic("Memoize: argument must be a function")
@@ -183,7 +203,20 @@ func Memoize[F any](f F, options ...Option) F {
 		return result
 	})
 
-	return wrapped.Interface().(F)
+	invalidate := func() {
+		mutex.Lock()
+		defer mutex.Unlock()
+		cache = make(map[string]*list.Element)
+		lru.Init()
+		metrics.TotalItems = 0
+	}
+
+	return wrapped.Interface().(F), invalidate
+}
+
+func Memoize[F any](f F, options ...Option) F {
+	memoized, _ := MemoizeWithInvalidate(f, options...)
+	return memoized
 }
 
 func makeKey(args []reflect.Value, ignoreParams []int) string {
