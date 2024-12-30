@@ -647,3 +647,40 @@ func TestMemoizeErrorHandling(t *testing.T) {
 		t.Errorf("Expected 2 calls total, got %d", calls)
 	}
 }
+
+func TestMemoizeInvalidation(t *testing.T) {
+	count := 0
+	fn := func(x int) int {
+		count++
+		return x * 2
+	}
+
+	memoized, invalidate := MemoizeWithInvalidate(fn)
+
+	// First call - should increment count
+	if got := memoized(5); got != 10 {
+		t.Errorf("got %v, want 10", got)
+	}
+	if count != 1 {
+		t.Errorf("count = %v, want 1", count)
+	}
+
+	// Second call - should use cache
+	if got := memoized(5); got != 10 {
+		t.Errorf("got %v, want 10", got)
+	}
+	if count != 1 {
+		t.Errorf("count = %v, want 1", count)
+	}
+
+	// Invalidate cache
+	invalidate()
+
+	// Call after invalidation - should increment count
+	if got := memoized(5); got != 10 {
+		t.Errorf("got %v, want 10", got)
+	}
+	if count != 2 {
+		t.Errorf("count = %v, want 2", count)
+	}
+}
