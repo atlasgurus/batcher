@@ -21,9 +21,14 @@ type DBProvider func() (*gorm.DB, error)
 
 // InsertBatcher is a GORM batcher for batch inserts
 type InsertBatcher[T any] struct {
-	dbProvider DBProvider
-	batcher    batcher.BatchProcessorInterface[[]T]
-	config     *batcher.BatchProcessorConfig // Add access to config
+	dbProvider      DBProvider
+	batcher         batcher.BatchProcessorInterface[[]T]
+	config          *batcher.BatchProcessorConfig // Add access to config
+	validationError error
+}
+
+func (ib *InsertBatcher[T]) Error() error {
+	return ib.validationError
 }
 
 // UpdateBatcher is a GORM batcher for batch updates
@@ -67,7 +72,7 @@ func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 
 func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 	// Perform reflection once if decomposition is enabled
-	var fieldToTableMap map[string]string // fieldName -> tableName
+	var fieldToTypeMap map[string]reflect.Type // fieldName -> reflect.Type
 
 	if ib.config.DecomposeFields {
 		var model T
@@ -76,15 +81,19 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 			modelType = modelType.Elem()
 		}
 
-		// Pre-compute field names and their table names once
+		// Pre-compute field names and their types once
 		if modelType.Kind() == reflect.Struct {
-			fieldToTableMap = make(map[string]string)
+			fieldToTypeMap = make(map[string]reflect.Type)
 			for i := 0; i < modelType.NumField(); i++ {
 				field := modelType.Field(i)
 				if field.IsExported() {
-					fieldName := field.Name
-					tableName := getTableNameFromType(field.Type)
-					fieldToTableMap[fieldName] = tableName
+					// Check if we can interface with this field type
+					fieldValue := reflect.New(field.Type).Elem()
+					if !fieldValue.CanInterface() {
+						ib.validationError = fmt.Errorf("field %s of type %s cannot be interfaced for decomposition", field.Name, field.Type)
+						break
+					}
+					fieldToTypeMap[field.Name] = field.Type
 				}
 			}
 		}
@@ -93,6 +102,11 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 	return func(batches [][]T) []error {
 		if len(batches) == 0 {
 			return nil
+		}
+
+		// Return validation error if field decomposition setup failed
+		if ib.validationError != nil {
+			return batcher.RepeatErr(len(batches), ib.validationError)
 		}
 
 		var allRecords []T
@@ -106,7 +120,7 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 
 		err := retryWithDeadlockDetection(maxRetries, ib.dbProvider, func(tx *gorm.DB) error {
 			if ib.config.DecomposeFields {
-				return insertByFieldsOptimized(tx, allRecords, fieldToTableMap)
+				return insertByFields(tx, allRecords, fieldToTypeMap)
 			} else {
 				return tx.Clauses(clause.OnConflict{
 					UpdateAll: true,
@@ -122,12 +136,12 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 	}
 }
 
-func insertByFieldsOptimized[T any](tx *gorm.DB, records []T, fieldToTableMap map[string]string) error {
+func insertByFields[T any](tx *gorm.DB, records []T, fieldToTypeMap map[string]reflect.Type) error {
 	if len(records) == 0 {
 		return nil
 	}
 
-	// Group model instances by their reflect.Type (not just table name)
+	// Group model instances by their precomputed reflect.Type
 	typeBatches := make(map[reflect.Type][]interface{})
 
 	for _, record := range records {
@@ -136,14 +150,14 @@ func insertByFieldsOptimized[T any](tx *gorm.DB, records []T, fieldToTableMap ma
 			rv = rv.Elem()
 		}
 
-		// Use pre-computed field-to-table mapping
-		for fieldName := range fieldToTableMap {
+		// Use precomputed field-to-type mapping - all fields should be valid
+		for fieldName, fieldType := range fieldToTypeMap {
 			fieldValue := rv.FieldByName(fieldName)
-			if fieldValue.IsValid() && fieldValue.CanInterface() {
-				modelInstance := fieldValue.Interface()
-				modelType := reflect.TypeOf(modelInstance)
-				typeBatches[modelType] = append(typeBatches[modelType], modelInstance)
+			if !fieldValue.IsValid() {
+				return fmt.Errorf("field %s is not valid on record instance", fieldName)
 			}
+			modelInstance := fieldValue.Interface()
+			typeBatches[fieldType] = append(typeBatches[fieldType], modelInstance)
 		}
 	}
 
