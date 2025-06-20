@@ -23,6 +23,7 @@ type DBProvider func() (*gorm.DB, error)
 type InsertBatcher[T any] struct {
 	dbProvider DBProvider
 	batcher    batcher.BatchProcessorInterface[[]T]
+	config     *batcher.BatchProcessorConfig // Add access to config
 }
 
 // UpdateBatcher is a GORM batcher for batch updates
@@ -49,27 +50,147 @@ func NewInsertBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 
 // NewInsertBatcherWithOptions creates a new InsertBatcher with custom options
 func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, opts ...batcher.Option) *InsertBatcher[T] {
-	return &InsertBatcher[T]{
+	// Create config and apply options to determine if decompose is enabled
+	config := batcher.DefaultConfig()
+	for _, opt := range opts {
+		opt(&config)
+	}
+
+	ib := &InsertBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchInsert[T](dbProvider), opts...),
+		config:     &config,
+	}
+
+	ib.batcher = batcher.NewBatchProcessorWithOptions(ctx, ib.createBatchInsertFunc(), opts...)
+	return ib
+}
+
+func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
+	// Perform reflection once if decomposition is enabled
+	var fieldToTableMap map[string]string // fieldName -> tableName
+
+	if ib.config.DecomposeFields {
+		var model T
+		modelType := reflect.TypeOf(model)
+		if modelType.Kind() == reflect.Ptr {
+			modelType = modelType.Elem()
+		}
+
+		// Pre-compute field names and their table names once
+		if modelType.Kind() == reflect.Struct {
+			fieldToTableMap = make(map[string]string)
+			for i := 0; i < modelType.NumField(); i++ {
+				field := modelType.Field(i)
+				if field.IsExported() {
+					fieldName := field.Name
+					tableName := getTableNameFromType(field.Type)
+					fieldToTableMap[fieldName] = tableName
+				}
+			}
+		}
+	}
+
+	return func(batches [][]T) []error {
+		if len(batches) == 0 {
+			return nil
+		}
+
+		var allRecords []T
+		for _, batch := range batches {
+			allRecords = append(allRecords, batch...)
+		}
+
+		if len(allRecords) == 0 {
+			return batcher.RepeatErr(len(batches), nil)
+		}
+
+		err := retryWithDeadlockDetection(maxRetries, ib.dbProvider, func(tx *gorm.DB) error {
+			if ib.config.DecomposeFields {
+				return insertByFieldsOptimized(tx, allRecords, fieldToTableMap)
+			} else {
+				return tx.Clauses(clause.OnConflict{
+					UpdateAll: true,
+				}).CreateInBatches(allRecords, len(allRecords)).Error
+			}
+		})
+
+		if err != nil {
+			return batcher.RepeatErr(len(batches), err)
+		}
+
+		return batcher.RepeatErr(len(batches), nil)
 	}
 }
 
-// Helper function to get table name from struct
+func insertByFieldsOptimized[T any](tx *gorm.DB, records []T, fieldToTableMap map[string]string) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	// Group model instances by their reflect.Type (not just table name)
+	typeBatches := make(map[reflect.Type][]interface{})
+
+	for _, record := range records {
+		rv := reflect.ValueOf(record)
+		if rv.Kind() == reflect.Ptr {
+			rv = rv.Elem()
+		}
+
+		// Use pre-computed field-to-table mapping
+		for fieldName := range fieldToTableMap {
+			fieldValue := rv.FieldByName(fieldName)
+			if fieldValue.IsValid() && fieldValue.CanInterface() {
+				modelInstance := fieldValue.Interface()
+				modelType := reflect.TypeOf(modelInstance)
+				typeBatches[modelType] = append(typeBatches[modelType], modelInstance)
+			}
+		}
+	}
+
+	// Insert each type batch separately within the same transaction
+	for modelType, modelInstances := range typeBatches {
+		if len(modelInstances) > 0 {
+			// Create a properly typed slice for GORM
+			sliceType := reflect.SliceOf(modelType)
+			typedSlice := reflect.MakeSlice(sliceType, len(modelInstances), len(modelInstances))
+
+			for i, instance := range modelInstances {
+				typedSlice.Index(i).Set(reflect.ValueOf(instance))
+			}
+
+			// Convert back to interface{} but now it's a properly typed slice
+			typedSliceInterface := typedSlice.Interface()
+
+			err := tx.Clauses(clause.OnConflict{
+				UpdateAll: true,
+			}).CreateInBatches(typedSliceInterface, len(modelInstances)).Error
+			if err != nil {
+				return fmt.Errorf("failed to insert field batch for type %s: %w", modelType.Name(), err)
+			}
+		}
+	}
+	return nil
+}
+
+// Helper function to get table name from struct type
 func getTableName[T any]() string {
 	var model T
-	t := reflect.TypeOf(model)
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
+	return getTableNameFromType(reflect.TypeOf(model))
+}
+
+func getTableNameFromType(fieldType reflect.Type) string {
+	// Handle pointer types
+	if fieldType.Kind() == reflect.Ptr {
+		fieldType = fieldType.Elem()
 	}
 
 	// Check if the type implements TableName method
-	if tn, ok := reflect.New(t).Interface().(interface{ TableName() string }); ok {
+	if tn, ok := reflect.New(fieldType).Interface().(interface{ TableName() string }); ok {
 		return tn.TableName()
 	}
 
 	// Default to struct name converted to snake case plural
-	return toSnakeCase(t.Name()) + "s"
+	return toSnakeCase(fieldType.Name()) + "s"
 }
 
 // Legacy constructor calls the new options-based one
@@ -160,35 +281,6 @@ const (
 	maxRetries = 3
 	baseDelay  = 100 * time.Millisecond
 )
-
-func batchInsert[T any](dbProvider DBProvider) func([][]T) []error {
-	return func(batches [][]T) []error {
-		if len(batches) == 0 {
-			return nil
-		}
-
-		var allRecords []T
-		for _, batch := range batches {
-			allRecords = append(allRecords, batch...)
-		}
-
-		if len(allRecords) == 0 {
-			return batcher.RepeatErr(len(batches), nil)
-		}
-
-		err := retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
-			return tx.Clauses(clause.OnConflict{
-				UpdateAll: true,
-			}).CreateInBatches(allRecords, len(allRecords)).Error
-		})
-
-		if err != nil {
-			return batcher.RepeatErr(len(batches), err)
-		}
-
-		return batcher.RepeatErr(len(batches), nil)
-	}
-}
 
 func executeIndividualUpdates[T any](
 	tx *gorm.DB,

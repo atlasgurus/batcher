@@ -15,6 +15,7 @@ type BatchProcessorConfig struct {
 	MaxBatchSize     int
 	MaxWaitTime      time.Duration
 	MetricsCollector MetricsCollector
+	DecomposeFields  bool
 }
 
 // DefaultConfig returns a BatchProcessorConfig with default values
@@ -59,6 +60,13 @@ func WithMaxBatchSize(size int) Option {
 func WithMaxWaitTime(duration time.Duration) Option {
 	return func(config *BatchProcessorConfig) {
 		config.MaxWaitTime = duration
+	}
+}
+
+// WithMaxWaitTime sets the maximum wait time
+func WithDecomposeFields(decomposeFields bool) Option {
+	return func(config *BatchProcessorConfig) {
+		config.DecomposeFields = decomposeFields
 	}
 }
 
