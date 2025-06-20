@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/atlasgurus/batcher/batcher"
 	gormv1 "github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/mysql"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
@@ -1212,4 +1213,131 @@ func TestUpdateBatcherFieldMergingMultipleIDs(t *testing.T) {
 		assert.Equal(t, initialModels[i].MyValue+10, model.MyValue)
 		assert.Equal(t, time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC), model.UpdatedAt)
 	}
+}
+
+func TestInsertBatcherWithDecomposeFields(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Test model that decomposes into existing models
+	type DecomposeTestModel struct {
+		TestModelData    TestModel
+		CompositeKeyData CompositeKeyModel
+	}
+
+	// Create batcher with DecomposeFields enabled
+	batcher := NewInsertBatcherWithOptions[*DecomposeTestModel](
+		getDBProvider(),
+		ctx,
+		batcher.WithDecomposeFields(true),
+		batcher.WithMaxBatchSize(3),
+		batcher.WithMaxWaitTime(100*time.Millisecond),
+	)
+
+	// Clean up tables before the test
+	db.Exec("DELETE FROM test_models")
+	db.Exec("DELETE FROM composite_key_models")
+
+	// Create test data
+	testModels := []*DecomposeTestModel{
+		{
+			TestModelData: TestModel{
+				ID:      1,
+				Name:    "Decomposed Test 1",
+				MyValue: 100,
+			},
+			CompositeKeyData: CompositeKeyModel{
+				ID1:     1,
+				ID2:     "A",
+				Name:    "Decomposed Composite 1",
+				MyValue: 200,
+			},
+		},
+		{
+			TestModelData: TestModel{
+				ID:      2,
+				Name:    "Decomposed Test 2",
+				MyValue: 101,
+			},
+			CompositeKeyData: CompositeKeyModel{
+				ID1:     2,
+				ID2:     "B",
+				Name:    "Decomposed Composite 2",
+				MyValue: 201,
+			},
+		},
+	}
+
+	// Insert test models - should decompose into separate tables
+	err := batcher.Insert(testModels...)
+	assert.NoError(t, err)
+
+	// Verify that data was inserted into both tables
+	var testModelCount, compositeKeyCount int64
+
+	db.Model(&TestModel{}).Count(&testModelCount)
+	assert.Equal(t, int64(2), testModelCount, "Expected 2 test model records")
+
+	db.Model(&CompositeKeyModel{}).Count(&compositeKeyCount)
+	assert.Equal(t, int64(2), compositeKeyCount, "Expected 2 composite key records")
+
+	// Verify the actual data in TestModel table
+	var testModelsFromDB []TestModel
+	db.Order("id").Find(&testModelsFromDB)
+	assert.Len(t, testModelsFromDB, 2)
+	assert.Equal(t, "Decomposed Test 1", testModelsFromDB[0].Name)
+	assert.Equal(t, 100, testModelsFromDB[0].MyValue)
+	assert.Equal(t, "Decomposed Test 2", testModelsFromDB[1].Name)
+	assert.Equal(t, 101, testModelsFromDB[1].MyValue)
+
+	// Verify the actual data in CompositeKeyModel table
+	var compositeModelsFromDB []CompositeKeyModel
+	db.Order("id1, id2").Find(&compositeModelsFromDB)
+	assert.Len(t, compositeModelsFromDB, 2)
+	assert.Equal(t, 1, compositeModelsFromDB[0].ID1)
+	assert.Equal(t, "A", compositeModelsFromDB[0].ID2)
+	assert.Equal(t, "Decomposed Composite 1", compositeModelsFromDB[0].Name)
+	assert.Equal(t, 200, compositeModelsFromDB[0].MyValue)
+	assert.Equal(t, 2, compositeModelsFromDB[1].ID1)
+	assert.Equal(t, "B", compositeModelsFromDB[1].ID2)
+	assert.Equal(t, "Decomposed Composite 2", compositeModelsFromDB[1].Name)
+	assert.Equal(t, 201, compositeModelsFromDB[1].MyValue)
+}
+
+func TestInsertBatcherWithoutDecomposeFields(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create batcher with DecomposeFields disabled (default)
+	batcher := NewInsertBatcherWithOptions[*TestModel](
+		getDBProvider(),
+		ctx,
+		batcher.WithDecomposeFields(false),
+		batcher.WithMaxBatchSize(3),
+		batcher.WithMaxWaitTime(100*time.Millisecond),
+	)
+
+	// Clean up table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Create test data
+	testModels := []*TestModel{
+		{Name: "Normal Test 1", MyValue: 10},
+		{Name: "Normal Test 2", MyValue: 20},
+	}
+
+	// Insert test models - should use normal insertion
+	err := batcher.Insert(testModels...)
+	assert.NoError(t, err)
+
+	// Verify that data was inserted into the main table normally
+	var count int64
+	db.Model(&TestModel{}).Count(&count)
+	assert.Equal(t, int64(2), count, "Expected 2 test model records")
+
+	var modelsFromDB []TestModel
+	db.Order("my_value").Find(&modelsFromDB)
+	assert.Len(t, modelsFromDB, 2)
+	assert.Equal(t, "Normal Test 1", modelsFromDB[0].Name)
+	assert.Equal(t, "Normal Test 2", modelsFromDB[1].Name)
 }
