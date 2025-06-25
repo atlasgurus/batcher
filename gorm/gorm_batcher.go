@@ -25,6 +25,7 @@ type InsertBatcher[T any] struct {
 	batcher         batcher.BatchProcessorInterface[[]T]
 	config          *batcher.BatchProcessorConfig // Add access to config
 	validationError error
+	timeout         int
 }
 
 func (ib *InsertBatcher[T]) Error() error {
@@ -118,7 +119,7 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
-		err := retryWithDeadlockDetection(maxRetries, ib.dbProvider, func(tx *gorm.DB) error {
+		err := retryWithDeadlockDetection(maxRetries, ib.timeout, ib.dbProvider, func(tx *gorm.DB) error {
 			if ib.config.DecomposeFields {
 				return insertByFields(tx, allRecords, fieldToTypeMap)
 			} else {
@@ -219,6 +220,12 @@ func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 
 // NewUpdateBatcherWithOptions primary constructor using options
 func NewUpdateBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, opts ...batcher.Option) (*UpdateBatcher[T], error) {
+	// Create config and apply options to determine if decompose is enabled
+	config := batcher.DefaultConfig()
+	for _, opt := range opts {
+		opt(&config)
+	}
+
 	tableName := getTableName[T]()
 	var model T
 	primaryKeyField, primaryKeyName, keyErr := getPrimaryKeyInfo(reflect.TypeOf(model))
@@ -228,7 +235,7 @@ func NewUpdateBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 
 	return &UpdateBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchUpdate[T](dbProvider, tableName, primaryKeyField, primaryKeyName), opts...),
+		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchUpdate[T](dbProvider, tableName, primaryKeyField, primaryKeyName, config.Timeout), opts...),
 		tableName:  tableName,
 	}, nil
 }
@@ -453,7 +460,8 @@ func batchUpdate[T any](
 	dbProvider DBProvider,
 	tableName string,
 	primaryKeyFields []reflect.StructField,
-	primaryKeyNames []string) func([][]UpdateItem[T]) []error {
+	primaryKeyNames []string,
+	timeout int) func([][]UpdateItem[T]) []error {
 	return func(batches [][]UpdateItem[T]) []error {
 		if len(batches) == 0 {
 			return nil
@@ -587,7 +595,7 @@ func batchUpdate[T any](
 
 		var batchErr error
 		if useMultipleStatements {
-			batchErr = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+			batchErr = retryWithDeadlockDetection(maxRetries, timeout, dbProvider, func(tx *gorm.DB) error {
 				return executeUpdatesBatchAsSeparateStatements(
 					tx,
 					tableName,
@@ -604,7 +612,7 @@ func batchUpdate[T any](
 
 		} else {
 			// Try batch update first
-			batchErr = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+			batchErr = retryWithDeadlockDetection(maxRetries, timeout, dbProvider, func(tx *gorm.DB) error {
 				return tx.Exec(queryBuilder.String(), allValues...).Error
 			})
 
@@ -617,7 +625,7 @@ func batchUpdate[T any](
 		// If batch update fails, try individual updates
 		var fallbackErrors []error
 		for _, updateItem := range allUpdateItems {
-			if retryErr := retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+			if retryErr := retryWithDeadlockDetection(maxRetries, timeout, dbProvider, func(tx *gorm.DB) error {
 				return executeIndividualUpdates(
 					tx,
 					tableName,
@@ -809,6 +817,12 @@ func NewSelectBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTim
 
 // NewSelectBatcherWithOptions creates a new SelectBatcher with custom options
 func NewSelectBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Context, columns []string, opts ...batcher.Option) (*SelectBatcher[T], error) {
+	// Create config and apply options to determine if decompose is enabled
+	config := batcher.DefaultConfig()
+	for _, opt := range opts {
+		opt(&config)
+	}
+
 	tableName := getTableName[T]()
 
 	// Validate columns against model
@@ -836,7 +850,7 @@ func NewSelectBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 
 	return &SelectBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchSelect[T](dbProvider, tableName, columns), opts...),
+		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchSelect[T](dbProvider, tableName, columns, config.Timeout), opts...),
 		tableName:  tableName,
 		columns:    columns,
 	}, nil
@@ -912,7 +926,7 @@ func processRows[T any](rows *sql.Rows, columns []string, allItems []SelectItem[
 	return nil
 }
 
-func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string) func([][]SelectItem[T]) []error {
+func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string, timeout int) func([][]SelectItem[T]) []error {
 	return func(batches [][]SelectItem[T]) (errs []error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -960,7 +974,7 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 		queryBuilder.WriteString(fmt.Sprintf(" ORDER BY %s", quoteIdentifier("__index", dialectName)))
 
 		var processingErr error
-		err = retryWithDeadlockDetection(maxRetries, dbProvider, func(tx *gorm.DB) error {
+		err = retryWithDeadlockDetection(maxRetries, timeout, dbProvider, func(tx *gorm.DB) error {
 			rows, err := tx.Raw(queryBuilder.String(), args...).Rows()
 			if err != nil {
 				return err
@@ -1139,7 +1153,7 @@ func scanIntoStruct(result interface{}, columns []string, values []interface{}) 
 	return nil
 }
 
-func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation func(*gorm.DB) error) error {
+func retryWithDeadlockDetection(maxRetries int, timeout int, dbProvider DBProvider, operation func(*gorm.DB) error) error {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		db, err := dbProvider()
@@ -1159,9 +1173,9 @@ func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation
 		// Create a session within transaction to avoid updating the global session
 		sessionDB := tx.Session(&gorm.Session{})
 
-		if db.Dialector.Name() == "mysql" {
+		if timeout > 0 && db.Dialector.Name() == "mysql" {
 			// Set lock wait timeout for this session
-			if timeoutSetErr := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = 1").Error; timeoutSetErr != nil {
+			if timeoutSetErr := sessionDB.Exec(fmt.Sprintf("SET SESSION innodb_lock_wait_timeout = %d", timeout)).Error; timeoutSetErr != nil {
 				sessionDB.Rollback()
 				return fmt.Errorf("failed to set session timeout: %w", timeoutSetErr)
 			}
@@ -1181,7 +1195,7 @@ func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation
 		}
 
 		// Reset timeout before committing, so we can still use the session
-		if db.Dialector.Name() == "mysql" {
+		if timeout > 0 && db.Dialector.Name() == "mysql" {
 			if resetErr := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = DEFAULT").Error; resetErr != nil {
 				// Log the error but don't fail the operation
 				fmt.Printf("Warning: failed to reset session timeout: %v\n", resetErr)

@@ -1359,7 +1359,12 @@ func TestConnectionPoolPollution(t *testing.T) {
 	assert.NoError(t, result.Error)
 
 	// Create an update batcher that will use retryWithDeadlockDetection
-	updateBatcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	updateBatcher, err := NewUpdateBatcherWithOptions[*TestModel](
+		getDBProvider(),
+		ctx,
+		batcher.WithTimeout(1),
+		batcher.WithMaxBatchSize(3),
+		batcher.WithMaxWaitTime(100*time.Millisecond))
 	assert.NoError(t, err)
 
 	// First, check the default timeout value
