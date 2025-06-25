@@ -1341,3 +1341,71 @@ func TestInsertBatcherWithoutDecomposeFields(t *testing.T) {
 	assert.Equal(t, "Normal Test 1", modelsFromDB[0].Name)
 	assert.Equal(t, "Normal Test 2", modelsFromDB[1].Name)
 }
+
+func TestConnectionPoolPollution(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert initial data that will create lock contention
+	initialModels := []*TestModel{
+		{ID: 1, Name: "Test 1", MyValue: 10},
+		{ID: 2, Name: "Test 2", MyValue: 20},
+		{ID: 3, Name: "Test 3", MyValue: 30},
+	}
+	result := db.Create(&initialModels)
+	assert.NoError(t, result.Error)
+
+	// Create an update batcher that will use retryWithDeadlockDetection
+	updateBatcher, err := NewUpdateBatcher[*TestModel](getDBProvider(), 3, 100*time.Millisecond, ctx)
+	assert.NoError(t, err)
+
+	// First, check the default timeout value
+	var defaultTimeout int
+	err = db.Raw("SELECT @@SESSION.innodb_lock_wait_timeout").Row().Scan(&defaultTimeout)
+	assert.NoError(t, err)
+	t.Logf("Default innodb_lock_wait_timeout: %d", defaultTimeout)
+
+	// Perform an update operation that will trigger retryWithDeadlockDetection
+	// This should set innodb_lock_wait_timeout = 1 and then reset it
+	updateModel := &TestModel{
+		ID:      1,
+		Name:    "Updated Test 1",
+		MyValue: 15,
+	}
+	err = updateBatcher.Update([]*TestModel{updateModel}, []string{"Name", "MyValue"})
+	assert.NoError(t, err)
+
+	// Now check if the timeout was properly reset
+	// If the bug exists, this will show timeout = 1
+	// If the fix works, this should show the default timeout (usually 50)
+	var timeoutAfterUpdate int
+	err = db.Raw("SELECT @@SESSION.innodb_lock_wait_timeout").Row().Scan(&timeoutAfterUpdate)
+	assert.NoError(t, err)
+	t.Logf("innodb_lock_wait_timeout after update: %d", timeoutAfterUpdate)
+
+	// The timeout should be reset to default, not stuck at 1
+	assert.Equal(t, defaultTimeout, timeoutAfterUpdate,
+		"innodb_lock_wait_timeout should be reset to default (%d) but was %d",
+		defaultTimeout, timeoutAfterUpdate)
+
+	// Additional test: simulate getting a "polluted" connection from the pool
+	// by directly checking multiple times
+	for i := 0; i < 5; i++ {
+		// Get a fresh connection from the pool
+		freshDB, err := getDBProvider()()
+		assert.NoError(t, err)
+
+		var currentTimeout int
+		err = freshDB.Raw("SELECT @@SESSION.innodb_lock_wait_timeout").Row().Scan(&currentTimeout)
+		assert.NoError(t, err)
+		t.Logf("Connection %d timeout: %d", i+1, currentTimeout)
+
+		// Each connection from the pool should have the default timeout
+		assert.Equal(t, defaultTimeout, currentTimeout,
+			"Connection %d from pool should have default timeout (%d) but had %d",
+			i+1, defaultTimeout, currentTimeout)
+	}
+}

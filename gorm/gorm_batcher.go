@@ -1180,6 +1180,14 @@ func retryWithDeadlockDetection(maxRetries int, dbProvider DBProvider, operation
 			continue
 		}
 
+		// Reset timeout before committing, so we can still use the session
+		if db.Dialector.Name() == "mysql" {
+			if resetErr := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = DEFAULT").Error; resetErr != nil {
+				// Log the error but don't fail the operation
+				fmt.Printf("Warning: failed to reset session timeout: %v\n", resetErr)
+			}
+		}
+
 		// Commit the transaction
 		if err = sessionDB.Commit().Error; err != nil {
 			sessionDB.Rollback()
