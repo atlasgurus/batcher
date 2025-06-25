@@ -16,6 +16,7 @@ type BatchProcessorConfig struct {
 	MaxWaitTime      time.Duration
 	MetricsCollector MetricsCollector
 	DecomposeFields  bool
+	Timeout          int
 }
 
 // DefaultConfig returns a BatchProcessorConfig with default values
@@ -23,6 +24,7 @@ func DefaultConfig() BatchProcessorConfig {
 	return BatchProcessorConfig{
 		MaxBatchSize: 100,
 		MaxWaitTime:  time.Second,
+		Timeout:      0,
 	}
 }
 
@@ -63,7 +65,7 @@ func WithMaxWaitTime(duration time.Duration) Option {
 	}
 }
 
-// WithMaxWaitTime sets the maximum wait time
+// WithDecomposeFields sets the maximum wait time
 func WithDecomposeFields(decomposeFields bool) Option {
 	return func(config *BatchProcessorConfig) {
 		config.DecomposeFields = decomposeFields
@@ -74,6 +76,13 @@ func WithDecomposeFields(decomposeFields bool) Option {
 func WithMetrics(collector MetricsCollector) Option {
 	return func(config *BatchProcessorConfig) {
 		config.MetricsCollector = collector
+	}
+}
+
+// WithTimeout sets the timeout for processing items
+func WithTimeout(timeout int) Option {
+	return func(config *BatchProcessorConfig) {
+		config.Timeout = timeout
 	}
 }
 
