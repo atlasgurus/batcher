@@ -246,4 +246,194 @@ func TestBatchProcessor(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("WaitForShutdown", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var mu sync.Mutex
+		processed := make([]int, 0)
+		processor := NewBatchProcessor(
+			5,
+			100*time.Millisecond,
+			ctx,
+			func(items []int) []error {
+				mu.Lock()
+				processed = append(processed, items...)
+				mu.Unlock()
+				return make([]error, len(items))
+			},
+		)
+
+		// Submit some items
+		var wg sync.WaitGroup
+		for i := 1; i <= 3; i++ {
+			wg.Add(1)
+			go func(item int) {
+				defer wg.Done()
+				err := processor.SubmitAndWait(item)
+				assert.NoError(t, err)
+			}(i)
+		}
+		wg.Wait()
+
+		// Cancel context to initiate shutdown
+		cancel()
+
+		// Wait for shutdown to complete
+		shutdownDone := make(chan struct{})
+		go func() {
+			processor.WaitForShutdown()
+			close(shutdownDone)
+		}()
+
+		// Should complete within reasonable time
+		select {
+		case <-shutdownDone:
+			// Success
+		case <-time.After(2 * time.Second):
+			t.Fatal("WaitForShutdown did not complete in time")
+		}
+
+		// Verify all items were processed
+		mu.Lock()
+		assert.Len(t, processed, 3)
+		mu.Unlock()
+	})
+
+	t.Run("WaitForShutdownMultipleBatchers", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// Create multiple batchers
+		batchers := make([]BatchProcessorInterface[int], 3)
+		processedCounts := make([]int, 3)
+		var mus [3]sync.Mutex
+
+		for i := 0; i < 3; i++ {
+			idx := i
+			batchers[i] = NewBatchProcessor(
+				5,
+				100*time.Millisecond,
+				ctx,
+				func(items []int) []error {
+					mus[idx].Lock()
+					processedCounts[idx] += len(items)
+					mus[idx].Unlock()
+					return make([]error, len(items))
+				},
+			)
+		}
+
+		// Submit items to each batcher
+		for i, bp := range batchers {
+			for j := 0; j < 5; j++ {
+				go func(processor BatchProcessorInterface[int], val int) {
+					err := processor.SubmitAndWait(val)
+					assert.NoError(t, err)
+				}(bp, i*10+j)
+			}
+		}
+
+		// Give time for submissions
+		time.Sleep(50 * time.Millisecond)
+
+		// Cancel context to initiate shutdown
+		cancel()
+
+		// Wait for all batchers to shut down
+		var wg sync.WaitGroup
+		for _, bp := range batchers {
+			wg.Add(1)
+			go func(processor BatchProcessorInterface[int]) {
+				defer wg.Done()
+				processor.WaitForShutdown()
+			}(bp)
+		}
+
+		// Wait with timeout
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Success
+		case <-time.After(2 * time.Second):
+			t.Fatal("WaitForShutdown did not complete for all batchers in time")
+		}
+
+		// Verify all items were processed
+		for i := 0; i < 3; i++ {
+			mus[i].Lock()
+			assert.Equal(t, 5, processedCounts[i], "batcher %d should have processed 5 items", i)
+			mus[i].Unlock()
+		}
+	})
+
+	t.Run("WaitForShutdownWithPendingItems", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var mu sync.Mutex
+		processed := make([]int, 0)
+		processingStarted := make(chan struct{})
+		once := sync.Once{}
+
+		processor := NewBatchProcessor(
+			10,
+			1*time.Second, // Long wait time so items stay pending
+			ctx,
+			func(items []int) []error {
+				once.Do(func() { close(processingStarted) })
+				mu.Lock()
+				processed = append(processed, items...)
+				mu.Unlock()
+				return make([]error, len(items))
+			},
+		)
+
+		// Submit items but don't reach batch size
+		var wg sync.WaitGroup
+		for i := 1; i <= 3; i++ {
+			wg.Add(1)
+			go func(item int) {
+				defer wg.Done()
+				err := processor.SubmitAndWait(item)
+				assert.NoError(t, err)
+			}(i)
+		}
+
+		// Give time for all submissions to be queued
+		time.Sleep(50 * time.Millisecond)
+
+		// Cancel context to trigger shutdown with pending items
+		cancel()
+
+		// Wait for processing to start
+		select {
+		case <-processingStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("processing did not start")
+		}
+
+		// Wait for all items to be processed
+		wg.Wait()
+
+		// Wait for shutdown
+		shutdownDone := make(chan struct{})
+		go func() {
+			processor.WaitForShutdown()
+			close(shutdownDone)
+		}()
+
+		select {
+		case <-shutdownDone:
+			// Success
+		case <-time.After(2 * time.Second):
+			t.Fatal("WaitForShutdown did not complete in time")
+		}
+
+		// Verify all pending items were processed before shutdown
+		mu.Lock()
+		assert.Len(t, processed, 3)
+		mu.Unlock()
+	})
 }

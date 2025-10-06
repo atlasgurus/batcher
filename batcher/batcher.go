@@ -32,6 +32,7 @@ func DefaultConfig() BatchProcessorConfig {
 type BatchProcessorInterface[T any] interface {
 	SubmitAndWait(item T) error
 	Submit(item T, callback func(error))
+	WaitForShutdown()
 }
 
 // BatchProcessor is a generic batch processor
@@ -41,6 +42,7 @@ type BatchProcessor[T any] struct {
 	processFn func([]T) []error
 	ctx       context.Context
 	metrics   *BatchMetrics
+	done      chan struct{}
 }
 
 type batchItem[T any] struct {
@@ -119,6 +121,7 @@ func NewBatchProcessorWithOptions[T any](
 		processFn: processFn,
 		ctx:       ctx,
 		metrics:   &BatchMetrics{},
+		done:      make(chan struct{}),
 	}
 
 	go bp.run()
@@ -153,7 +156,14 @@ func (bp *BatchProcessor[T]) Submit(item T, callback func(error)) {
 	}
 }
 
+// WaitForShutdown blocks until the batch processor has finished processing all remaining items and shut down
+func (bp *BatchProcessor[T]) WaitForShutdown() {
+	<-bp.done
+}
+
 func (bp *BatchProcessor[T]) run() {
+	defer close(bp.done)
+
 	var batch []T
 	var respChans []chan error
 	timer := time.NewTimer(bp.config.MaxWaitTime)
