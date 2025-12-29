@@ -34,7 +34,7 @@ func NewPrometheusMetricsCollector(processorName string) *PrometheusMetricsColle
 			prometheus.HistogramOpts{
 				Name:        "batcher_processing_duration_seconds",
 				Help:        "The duration of batch processing operations",
-				Buckets:     prometheus.ExponentialBuckets(0.001, 2, 10),
+				Buckets:     prometheus.ExponentialBuckets(0.001, 2, 16),
 				ConstLabels: prometheus.Labels{"processor": processorName},
 			},
 			[]string{},
