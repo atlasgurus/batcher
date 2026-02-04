@@ -24,7 +24,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.23'
       - name: Set MySQL DSN and Dialect
         run: |
           echo "DSN=root:rootpassword@tcp(127.0.0.1:3306)/testdb?parseTime=true" >> $GITHUB_ENV
@@ -32,7 +32,7 @@ jobs:
       - name: Build
         run: go build -v ./...
       - name: Test
-        run: go test -v ./...
+        run: go test -short -v ./...
       - name: Run Benchmark
         run: |
           set +e
@@ -47,7 +47,7 @@ jobs:
           DSN: ${{ env.DSN }}
           DIALECT: ${{ env.DIALECT }}
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: mysql-benchmark-results
           path: benchmark_output.txt
@@ -73,7 +73,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.23'
       - name: Set Postgres DSN and Dialect
         run: |
           echo "DSN=postgres://postgres:postgrespassword@localhost:5432/testdb?sslmode=disable" >> $GITHUB_ENV
@@ -81,7 +81,7 @@ jobs:
       - name: Build
         run: go build -v ./...
       - name: Test
-        run: go test -v ./...
+        run: go test -short -v ./...
       - name: Run Benchmark
         run: |
           set +e
@@ -96,7 +96,7 @@ jobs:
           DSN: ${{ env.DSN }}
           DIALECT: ${{ env.DIALECT }}
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: postgres-benchmark-results
           path: benchmark_output.txt
@@ -112,7 +112,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.23'
       - name: Set up SQLite
         run: |
           sudo apt-get update
@@ -124,7 +124,7 @@ jobs:
       - name: Build
         run: go build -tags sqlite -v ./...
       - name: Test
-        run: go test -tags sqlite -v ./...
+        run: go test -tags sqlite -short -v ./...
       - name: Run Benchmark
         run: |
           set +e

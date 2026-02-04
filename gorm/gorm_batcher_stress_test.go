@@ -13,7 +13,9 @@ import (
 )
 
 func TestUpdateBatcherStressWithData(t *testing.T) {
-	//t.Skip("Skip this test as it is too slow")
+	if testing.Short() {
+		t.Skip("Skipping stress test in short mode")
+	}
 
 	createNewTable := false
 
