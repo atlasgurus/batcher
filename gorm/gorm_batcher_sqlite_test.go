@@ -884,17 +884,17 @@ func TestUpdateBatcherWithRelationships(t *testing.T) {
 	db.Exec("DROP TABLE IF EXISTS related_models")
 	db.Exec("DROP TABLE IF EXISTS parent_models")
 
-	// Create tables manually
+	// Create tables manually (SQLite-specific syntax)
 	createTableSQL := `
     CREATE TABLE parent_models (
-        id INTEGER PRIMARY KEY AUTO_INCREMENT,
-        name VARCHAR(100),
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
         my_value INTEGER
     );
-    
+
     CREATE TABLE related_models (
-        id INTEGER PRIMARY KEY AUTO_INCREMENT,
-        name VARCHAR(100),
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
         parent_id INTEGER
     );`
 
@@ -914,7 +914,7 @@ func TestUpdateBatcherWithRelationships(t *testing.T) {
 	assert.NoError(t, result.Error)
 
 	parentID := uint(0)
-	row := db.Raw("SELECT LAST_INSERT_ID()").Row()
+	row := db.Raw("SELECT last_insert_rowid()").Row()
 	err = row.Scan(&parentID)
 	assert.NoError(t, err)
 	assert.NotZero(t, parentID)
