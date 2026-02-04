@@ -909,6 +909,10 @@ type ParentModel struct {
 }
 
 func TestUpdateBatcherWithRelationships(t *testing.T) {
+	if dialect != "mysql" {
+		t.Skip("Skipping test - uses MySQL-specific syntax (AUTO_INCREMENT)")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
