@@ -1060,7 +1060,7 @@ func TestUpdateBatcherDuplicateIDs(t *testing.T) {
 	// The CASE statement ordering means the last matching condition wins
 	assert.Equal(t, "Update 3", finalModel.Name)
 	assert.Equal(t, 40, finalModel.MyValue)
-	assert.Equal(t, time3, finalModel.UpdatedAt)
+	assert.True(t, time3.Equal(finalModel.UpdatedAt), "Expected %v, got %v", time3, finalModel.UpdatedAt)
 }
 
 func TestUpdateBatcherFieldMerging(t *testing.T) {
@@ -1134,7 +1134,8 @@ func TestUpdateBatcherFieldMerging(t *testing.T) {
 	// The last update in the batch should take precedence
 	assert.Equal(t, "Final Name", finalModel.Name)
 	assert.Equal(t, 30, finalModel.MyValue)
-	assert.Equal(t, time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC), finalModel.UpdatedAt)
+	expectedTime := time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC)
+	assert.True(t, expectedTime.Equal(finalModel.UpdatedAt), "Expected %v, got %v", expectedTime, finalModel.UpdatedAt)
 }
 
 func TestUpdateBatcherFieldMergingMultipleIDs(t *testing.T) {
@@ -1211,11 +1212,12 @@ func TestUpdateBatcherFieldMergingMultipleIDs(t *testing.T) {
 	assert.Equal(t, 10, len(finalModels))
 
 	// Verify each record
+	expectedTime := time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC)
 	for i, model := range finalModels {
 		assert.Equal(t, uint(i+1), model.ID)
 		assert.Equal(t, fmt.Sprintf("Final Name %d", i+1), model.Name)
 		assert.Equal(t, initialModels[i].MyValue+10, model.MyValue)
-		assert.Equal(t, time.Date(2024, 10, 29, 21, 8, 36, 725000000, time.UTC), model.UpdatedAt)
+		assert.True(t, expectedTime.Equal(model.UpdatedAt), "Expected %v, got %v", expectedTime, model.UpdatedAt)
 	}
 }
 
@@ -1347,6 +1349,10 @@ func TestInsertBatcherWithoutDecomposeFields(t *testing.T) {
 }
 
 func TestConnectionPoolPollution(t *testing.T) {
+	if dialect != "mysql" {
+		t.Skip("Skipping test - uses MySQL-specific syntax (@@SESSION.innodb_lock_wait_timeout)")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
