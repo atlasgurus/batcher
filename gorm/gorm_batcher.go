@@ -21,11 +21,12 @@ type DBProvider func() (*gorm.DB, error)
 
 // InsertBatcher is a GORM batcher for batch inserts
 type InsertBatcher[T any] struct {
-	dbProvider      DBProvider
-	batcher         batcher.BatchProcessorInterface[[]T]
-	config          *batcher.BatchProcessorConfig // Add access to config
-	validationError error
-	timeout         int
+	dbProvider       DBProvider
+	batcher          batcher.BatchProcessorInterface[[]T]
+	config           *batcher.BatchProcessorConfig // Add access to config
+	validationError  error
+	timeout          int
+	primaryKeyFields []reflect.StructField
 }
 
 func (ib *InsertBatcher[T]) Error() error {
@@ -65,6 +66,14 @@ func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 	ib := &InsertBatcher[T]{
 		dbProvider: dbProvider,
 		config:     &config,
+	}
+
+	// Get primary key fields for deduplication (if available)
+	var model T
+	primaryKeyFields, _, keyErr := getPrimaryKeyInfo(reflect.TypeOf(model))
+	if keyErr == nil {
+		// Only set if primary key exists, otherwise deduplication will be skipped
+		ib.primaryKeyFields = primaryKeyFields
 	}
 
 	ib.batcher = batcher.NewBatchProcessorWithOptions(ctx, ib.createBatchInsertFunc(), opts...)
@@ -119,6 +128,9 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
+		// Deduplicate records by primary key (last value wins)
+		allRecords = dedupeInsertItems(allRecords, ib.primaryKeyFields)
+
 		err := retryWithDeadlockDetection(maxRetries, ib.timeout, ib.dbProvider, func(tx *gorm.DB) error {
 			if ib.config.DecomposeFields {
 				return insertByFields(tx, allRecords, fieldToTypeMap)
@@ -165,11 +177,14 @@ func insertByFields[T any](tx *gorm.DB, records []T, fieldToTypeMap map[string]r
 	// Insert each type batch separately within the same transaction
 	for modelType, modelInstances := range typeBatches {
 		if len(modelInstances) > 0 {
+			// Deduplicate child records by their primary keys
+			deduplicatedInstances := deduplicateChildRecords(modelInstances, modelType)
+
 			// Create a properly typed slice for GORM
 			sliceType := reflect.SliceOf(modelType)
-			typedSlice := reflect.MakeSlice(sliceType, len(modelInstances), len(modelInstances))
+			typedSlice := reflect.MakeSlice(sliceType, len(deduplicatedInstances), len(deduplicatedInstances))
 
-			for i, instance := range modelInstances {
+			for i, instance := range deduplicatedInstances {
 				typedSlice.Index(i).Set(reflect.ValueOf(instance))
 			}
 
@@ -178,7 +193,7 @@ func insertByFields[T any](tx *gorm.DB, records []T, fieldToTypeMap map[string]r
 
 			err := tx.Clauses(clause.OnConflict{
 				UpdateAll: true,
-			}).CreateInBatches(typedSliceInterface, len(modelInstances)).Error
+			}).CreateInBatches(typedSliceInterface, len(deduplicatedInstances)).Error
 			if err != nil {
 				return fmt.Errorf("failed to insert field batch for type %s: %w", modelType.Name(), err)
 			}
@@ -700,6 +715,85 @@ func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields [
 		})
 	}
 	return deduplicatedItems
+}
+
+// buildCompositeKey returns a composite key for records with non-zero PKs, or empty string for zero PKs
+func buildCompositeKey(itemValue reflect.Value, primaryKeyFields []reflect.StructField) (string, bool) {
+	if itemValue.Kind() == reflect.Ptr {
+		itemValue = itemValue.Elem()
+	}
+
+	// Check if all primary key fields have non-zero values
+	var keyParts []string
+	hasNonZeroPK := true
+
+	for _, pkField := range primaryKeyFields {
+		fieldValue := itemValue.FieldByName(pkField.Name)
+		keyParts = append(keyParts, fmt.Sprint(fieldValue.Interface()))
+
+		// Check if field is zero value (for auto-increment PKs)
+		if fieldValue.IsZero() {
+			hasNonZeroPK = false
+		}
+	}
+
+	if !hasNonZeroPK {
+		return "", false // Zero PK, should not be deduped
+	}
+
+	return strings.Join(keyParts, "-"), true
+}
+
+// deduplicateRecords is the core deduplication logic that works with any record type
+// It deduplicates records by primary key (last value wins) and preserves records with zero PKs
+func deduplicateRecords[T any](records []T, primaryKeyFields []reflect.StructField) []T {
+	if len(primaryKeyFields) == 0 {
+		// No primary key, cannot deduplicate
+		return records
+	}
+
+	// Track the latest value for each primary key
+	latestRecords := make(map[string]T)
+	var recordsWithoutPK []T
+
+	for _, record := range records {
+		compositeKey, hasKey := buildCompositeKey(reflect.ValueOf(record), primaryKeyFields)
+
+		if !hasKey {
+			// Zero PK - will be auto-generated, don't deduplicate
+			recordsWithoutPK = append(recordsWithoutPK, record)
+			continue
+		}
+
+		// Keep the latest value (last one wins)
+		latestRecords[compositeKey] = record
+	}
+
+	// Convert back to slice: deduplicated records + records without PK
+	deduplicatedRecords := make([]T, 0, len(latestRecords)+len(recordsWithoutPK))
+	for _, record := range latestRecords {
+		deduplicatedRecords = append(deduplicatedRecords, record)
+	}
+	deduplicatedRecords = append(deduplicatedRecords, recordsWithoutPK...)
+
+	return deduplicatedRecords
+}
+
+func deduplicateChildRecords(instances []interface{}, modelType reflect.Type) []interface{} {
+	// Get primary key info for this child type
+	primaryKeyFields, _, err := getPrimaryKeyInfo(modelType)
+	if err != nil || len(primaryKeyFields) == 0 {
+		// No primary key, cannot deduplicate
+		return instances
+	}
+
+	// Use the generic deduplication function
+	return deduplicateRecords(instances, primaryKeyFields)
+}
+
+func dedupeInsertItems[T any](allRecords []T, primaryKeyFields []reflect.StructField) []T {
+	// Use the generic deduplication function
+	return deduplicateRecords(allRecords, primaryKeyFields)
 }
 
 func isDeadlockError(err error) bool {

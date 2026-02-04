@@ -7,6 +7,6 @@ import gormv2 "gorm.io/gorm"
 
 func getSQLiteDialector(sqlDB interface{}) gormv2.Dialector {
 	return &sqlite.Dialector{
-		Conn: sqlDB,
+		Conn: sqlDB.(gormv2.ConnPool),
 	}
 }
