@@ -34,6 +34,7 @@ jobs:
       - name: Test
         run: go test -short -v ./...
       - name: Run Benchmark
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set +e
           go test -v -bench=BenchmarkGORMBatcher -benchtime=20s ./... > benchmark_output.txt 2>&1
@@ -83,6 +84,7 @@ jobs:
       - name: Test
         run: go test -short -v ./...
       - name: Run Benchmark
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set +e
           go test -v -bench=BenchmarkGORMBatcher -benchtime=20s ./... > benchmark_output.txt 2>&1
@@ -126,6 +128,7 @@ jobs:
       - name: Test
         run: go test -tags sqlite -short -v ./...
       - name: Run Benchmark
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set +e
           go test -tags sqlite -v -bench=BenchmarkGORMBatcher -benchtime=20s ./... > benchmark_output.txt 2>&1
