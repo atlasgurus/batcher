@@ -48,11 +48,13 @@ jobs:
           DSN: ${{ env.DSN }}
           DIALECT: ${{ env.DIALECT }}
       - name: Upload benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: mysql-benchmark-results
           path: benchmark_output.txt
       - name: Summarize benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           echo "## MySQL Benchmark Results" >> $GITHUB_STEP_SUMMARY
           grep "Benchmark Statistics:" -A 7 benchmark_output.txt >> $GITHUB_STEP_SUMMARY
@@ -98,11 +100,13 @@ jobs:
           DSN: ${{ env.DSN }}
           DIALECT: ${{ env.DIALECT }}
       - name: Upload benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: postgres-benchmark-results
           path: benchmark_output.txt
       - name: Summarize benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           echo "## PostgreSQL Benchmark Results" >> $GITHUB_STEP_SUMMARY
           grep "Benchmark Statistics:" -A 7 benchmark_output.txt >> $GITHUB_STEP_SUMMARY
