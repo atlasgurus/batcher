@@ -1424,45 +1424,40 @@ func buildOnConflictClauseForType(tx *gorm.DB, modelType reflect.Type) clause.On
 		return clause.OnConflict{UpdateAll: true}
 	}
 
-	// PostgreSQL/SQLite: ON CONFLICT requires explicit conflict targets
-	// Detect primary key and unique indexes from the model type
-	primaryKeyFields, _, _ := getPrimaryKeyInfo(modelType)
+	// PostgreSQL/SQLite: ON CONFLICT requires targeting a SINGLE unique constraint
+	// Strategy: Try unique indexes first (for auto-increment PKs), fall back to PK
+
 	uniqueIndexes := getUniqueIndexes(modelType)
+	primaryKeyFields, _, _ := getPrimaryKeyInfo(modelType)
 
-	var conflictColumns []clause.Column
-
-	// Add primary key columns
-	for _, pkField := range primaryKeyFields {
-		columnName := getDBFieldName(pkField)
-		conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
-	}
-
-	// Add unique index columns
-	for _, uniqueIndex := range uniqueIndexes {
-		for _, field := range uniqueIndex {
+	// If we have unique indexes, use the first one as conflict target
+	// This handles the common case where ID=0 (auto-increment) conflicts on unique index
+	if len(uniqueIndexes) > 0 {
+		var conflictColumns []clause.Column
+		for _, field := range uniqueIndexes[0] {
 			columnName := getDBFieldName(field)
-			// Avoid duplicates
-			alreadyAdded := false
-			for _, col := range conflictColumns {
-				if col.Name == columnName {
-					alreadyAdded = true
-					break
-				}
-			}
-			if !alreadyAdded {
-				conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
-			}
+			conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
 		}
-	}
-
-	// If we have conflict columns, use them; otherwise fall back to UpdateAll
-	if len(conflictColumns) > 0 {
 		return clause.OnConflict{
 			Columns:   conflictColumns,
 			UpdateAll: true,
 		}
 	}
 
+	// No unique indexes, use primary key
+	if len(primaryKeyFields) > 0 {
+		var conflictColumns []clause.Column
+		for _, pkField := range primaryKeyFields {
+			columnName := getDBFieldName(pkField)
+			conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
+		}
+		return clause.OnConflict{
+			Columns:   conflictColumns,
+			UpdateAll: true,
+		}
+	}
+
+	// Fallback: let GORM handle it
 	return clause.OnConflict{UpdateAll: true}
 }
 
