@@ -152,9 +152,9 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 			if ib.config.DecomposeFields {
 				return insertByFields(tx, allRecords, fieldToTypeMap)
 			} else {
-				return tx.Clauses(clause.OnConflict{
-					UpdateAll: true,
-				}).CreateInBatches(allRecords, len(allRecords)).Error
+				// Build OnConflict clause with proper conflict targets
+				onConflict := ib.buildOnConflictClause(tx)
+				return tx.Clauses(onConflict).CreateInBatches(allRecords, len(allRecords)).Error
 			}
 		})
 
@@ -217,9 +217,9 @@ func insertByFields[T any](tx *gorm.DB, records []T, fieldToTypeMap map[string]r
 			// Convert back to interface{} but now it's a properly typed slice
 			typedSliceInterface := typedSlice.Interface()
 
-			err := tx.Clauses(clause.OnConflict{
-				UpdateAll: true,
-			}).CreateInBatches(typedSliceInterface, len(deduplicatedInstances)).Error
+			// Build OnConflict clause for this specific model type
+			onConflict := buildOnConflictClauseForType(tx, modelType)
+			err := tx.Clauses(onConflict).CreateInBatches(typedSliceInterface, len(deduplicatedInstances)).Error
 			if err != nil {
 				return fmt.Errorf("failed to insert field batch for type %s: %w", modelType.Name(), err)
 			}
@@ -1413,6 +1413,63 @@ func hasZeroPrimaryKey[T any](record T, primaryKeyFields []reflect.StructField) 
 	}
 
 	return true
+}
+
+// buildOnConflictClauseForType builds the appropriate OnConflict clause for a given model type
+func buildOnConflictClauseForType(tx *gorm.DB, modelType reflect.Type) clause.OnConflict {
+	dialect := tx.Dialector.Name()
+
+	// MySQL: ON DUPLICATE KEY UPDATE works with any unique constraint
+	if dialect == "mysql" {
+		return clause.OnConflict{UpdateAll: true}
+	}
+
+	// PostgreSQL/SQLite: ON CONFLICT requires explicit conflict targets
+	// Detect primary key and unique indexes from the model type
+	primaryKeyFields, _, _ := getPrimaryKeyInfo(modelType)
+	uniqueIndexes := getUniqueIndexes(modelType)
+
+	var conflictColumns []clause.Column
+
+	// Add primary key columns
+	for _, pkField := range primaryKeyFields {
+		columnName := getDBFieldName(pkField)
+		conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
+	}
+
+	// Add unique index columns
+	for _, uniqueIndex := range uniqueIndexes {
+		for _, field := range uniqueIndex {
+			columnName := getDBFieldName(field)
+			// Avoid duplicates
+			alreadyAdded := false
+			for _, col := range conflictColumns {
+				if col.Name == columnName {
+					alreadyAdded = true
+					break
+				}
+			}
+			if !alreadyAdded {
+				conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
+			}
+		}
+	}
+
+	// If we have conflict columns, use them; otherwise fall back to UpdateAll
+	if len(conflictColumns) > 0 {
+		return clause.OnConflict{
+			Columns:   conflictColumns,
+			UpdateAll: true,
+		}
+	}
+
+	return clause.OnConflict{UpdateAll: true}
+}
+
+// buildOnConflictClause builds the appropriate OnConflict clause based on database dialect
+func (ib *InsertBatcher[T]) buildOnConflictClause(tx *gorm.DB) clause.OnConflict {
+	var model T
+	return buildOnConflictClauseForType(tx, reflect.TypeOf(model))
 }
 
 // reloadRecordsByUniqueIndexes reloads records from database using unique indexes
