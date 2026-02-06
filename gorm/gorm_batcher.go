@@ -27,6 +27,8 @@ type InsertBatcher[T any] struct {
 	validationError  error
 	timeout          int
 	primaryKeyFields []reflect.StructField
+	uniqueIndexes    [][]reflect.StructField // Each element is a set of fields forming a unique index
+	tableName        string
 }
 
 func (ib *InsertBatcher[T]) Error() error {
@@ -63,18 +65,24 @@ func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 		opt(&config)
 	}
 
+	var model T
+	modelType := reflect.TypeOf(model)
+
 	ib := &InsertBatcher[T]{
 		dbProvider: dbProvider,
 		config:     &config,
+		tableName:  getTableNameFromType(modelType),
 	}
 
 	// Get primary key fields for deduplication (if available)
-	var model T
-	primaryKeyFields, _, keyErr := getPrimaryKeyInfo(reflect.TypeOf(model))
+	primaryKeyFields, _, keyErr := getPrimaryKeyInfo(modelType)
 	if keyErr == nil {
 		// Only set if primary key exists, otherwise deduplication will be skipped
 		ib.primaryKeyFields = primaryKeyFields
 	}
+
+	// Get unique index fields for ID reloading after IODKU
+	ib.uniqueIndexes = getUniqueIndexes(modelType)
 
 	ib.batcher = batcher.NewBatchProcessorWithOptions(ctx, ib.createBatchInsertFunc(), opts...)
 	return ib
@@ -131,18 +139,36 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 		// Deduplicate records by primary key (last value wins)
 		allRecords = dedupeInsertItems(allRecords, ib.primaryKeyFields)
 
+		// Track which records had zero IDs before insert (indicating potential IODKU update)
+		// GORM will populate IDs incorrectly for updated records, so we need to reload them
+		var recordsNeedingReload []int
+		for i, record := range allRecords {
+			if hasZeroPrimaryKey(record, ib.primaryKeyFields) {
+				recordsNeedingReload = append(recordsNeedingReload, i)
+			}
+		}
+
 		err := retryWithDeadlockDetection(maxRetries, ib.timeout, ib.dbProvider, func(tx *gorm.DB) error {
 			if ib.config.DecomposeFields {
 				return insertByFields(tx, allRecords, fieldToTypeMap)
 			} else {
-				return tx.Clauses(clause.OnConflict{
-					UpdateAll: true,
-				}).CreateInBatches(allRecords, len(allRecords)).Error
+				// Build OnConflict clause with proper conflict targets
+				onConflict := ib.buildOnConflictClause(tx)
+				return tx.Clauses(onConflict).CreateInBatches(allRecords, len(allRecords)).Error
 			}
 		})
 
 		if err != nil {
 			return batcher.RepeatErr(len(batches), err)
+		}
+
+		// CRITICAL FIX: Reload records that had zero IDs before insert
+		// GORM populates IDs using LastInsertID(), which is incorrect for IODKU updates
+		// We must reload these records from the database to get correct IDs
+		if len(recordsNeedingReload) > 0 && len(ib.uniqueIndexes) > 0 {
+			if reloadErr := ib.reloadRecordsByUniqueIndexes(allRecords, recordsNeedingReload); reloadErr != nil {
+				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to reload IDs after insert: %w", reloadErr))
+			}
 		}
 
 		return batcher.RepeatErr(len(batches), nil)
@@ -191,9 +217,9 @@ func insertByFields[T any](tx *gorm.DB, records []T, fieldToTypeMap map[string]r
 			// Convert back to interface{} but now it's a properly typed slice
 			typedSliceInterface := typedSlice.Interface()
 
-			err := tx.Clauses(clause.OnConflict{
-				UpdateAll: true,
-			}).CreateInBatches(typedSliceInterface, len(deduplicatedInstances)).Error
+			// Build OnConflict clause for this specific model type
+			onConflict := buildOnConflictClauseForType(tx, modelType)
+			err := tx.Clauses(onConflict).CreateInBatches(typedSliceInterface, len(deduplicatedInstances)).Error
 			if err != nil {
 				return fmt.Errorf("failed to insert field batch for type %s: %w", modelType.Name(), err)
 			}
@@ -283,6 +309,55 @@ func getPrimaryKeyInfo(t reflect.Type) ([]reflect.StructField, []string, error) 
 		return nil, nil, fmt.Errorf("no primary key found for type %v", t)
 	}
 	return primaryKeyFields, primaryKeyNames, nil
+}
+
+// getUniqueIndexes returns all unique indexes defined on the struct
+// Each element in the returned slice is a set of fields that form a unique constraint
+func getUniqueIndexes(t reflect.Type) [][]reflect.StructField {
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+
+	// Map of index name to fields
+	indexMap := make(map[string][]reflect.StructField)
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		gormTag := field.Tag.Get("gorm")
+
+		// Skip primary keys
+		if isPrimaryKey(field) {
+			continue
+		}
+
+		// Check for unique or uniqueIndex tags
+		if strings.Contains(gormTag, "unique") || strings.Contains(gormTag, "uniqueIndex") {
+			// Parse the tag to get index name
+			indexName := ""
+			tags := strings.Split(gormTag, ";")
+			for _, tag := range tags {
+				tag = strings.TrimSpace(tag)
+				if strings.HasPrefix(tag, "uniqueIndex:") {
+					indexName = strings.TrimPrefix(tag, "uniqueIndex:")
+				} else if tag == "unique" || tag == "uniqueIndex" {
+					// Single field unique constraint
+					indexName = field.Name
+				}
+			}
+
+			if indexName != "" {
+				indexMap[indexName] = append(indexMap[indexName], field)
+			}
+		}
+	}
+
+	// Convert map to slice
+	var uniqueIndexes [][]reflect.StructField
+	for _, fields := range indexMap {
+		uniqueIndexes = append(uniqueIndexes, fields)
+	}
+
+	return uniqueIndexes
 }
 
 // Insert submits one or more items for batch insertion
@@ -1317,4 +1392,150 @@ func retryWithDeadlockDetection(maxRetries int, timeout int, dbProvider DBProvid
 func delayNextAttempt(attempt int) {
 	delay := baseDelay * time.Duration(1<<uint(attempt)) * time.Duration(1+rand.Intn(100)) / 100
 	time.Sleep(delay)
+}
+
+// hasZeroPrimaryKey checks if all primary key fields have zero values
+func hasZeroPrimaryKey[T any](record T, primaryKeyFields []reflect.StructField) bool {
+	if len(primaryKeyFields) == 0 {
+		return false
+	}
+
+	rv := reflect.ValueOf(record)
+	if rv.Kind() == reflect.Ptr {
+		rv = rv.Elem()
+	}
+
+	for _, pkField := range primaryKeyFields {
+		fieldValue := rv.FieldByName(pkField.Name)
+		if !fieldValue.IsZero() {
+			return false
+		}
+	}
+
+	return true
+}
+
+// buildOnConflictClauseForType builds the appropriate OnConflict clause for a given model type
+func buildOnConflictClauseForType(tx *gorm.DB, modelType reflect.Type) clause.OnConflict {
+	dialect := tx.Dialector.Name()
+
+	// MySQL: ON DUPLICATE KEY UPDATE works with any unique constraint
+	if dialect == "mysql" {
+		return clause.OnConflict{UpdateAll: true}
+	}
+
+	// PostgreSQL/SQLite: ON CONFLICT requires targeting a SINGLE unique constraint
+	// Strategy: Try unique indexes first (for auto-increment PKs), fall back to PK
+
+	uniqueIndexes := getUniqueIndexes(modelType)
+	primaryKeyFields, _, _ := getPrimaryKeyInfo(modelType)
+
+	// If we have unique indexes, use the first one as conflict target
+	// This handles the common case where ID=0 (auto-increment) conflicts on unique index
+	if len(uniqueIndexes) > 0 {
+		var conflictColumns []clause.Column
+		for _, field := range uniqueIndexes[0] {
+			columnName := getDBFieldName(field)
+			conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
+		}
+		return clause.OnConflict{
+			Columns:   conflictColumns,
+			UpdateAll: true,
+		}
+	}
+
+	// No unique indexes, use primary key
+	if len(primaryKeyFields) > 0 {
+		var conflictColumns []clause.Column
+		for _, pkField := range primaryKeyFields {
+			columnName := getDBFieldName(pkField)
+			conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
+		}
+		return clause.OnConflict{
+			Columns:   conflictColumns,
+			UpdateAll: true,
+		}
+	}
+
+	// Fallback: let GORM handle it
+	return clause.OnConflict{UpdateAll: true}
+}
+
+// buildOnConflictClause builds the appropriate OnConflict clause based on database dialect
+func (ib *InsertBatcher[T]) buildOnConflictClause(tx *gorm.DB) clause.OnConflict {
+	var model T
+	return buildOnConflictClauseForType(tx, reflect.TypeOf(model))
+}
+
+// reloadRecordsByUniqueIndexes reloads records from database using unique indexes
+func (ib *InsertBatcher[T]) reloadRecordsByUniqueIndexes(allRecords []T, recordIndices []int) error {
+	if len(recordIndices) == 0 || len(ib.uniqueIndexes) == 0 {
+		return nil
+	}
+
+	db, err := ib.dbProvider()
+	if err != nil {
+		return fmt.Errorf("failed to get database connection: %w", err)
+	}
+
+	// For each record that needs reloading, query by unique indexes
+	for _, idx := range recordIndices {
+		record := allRecords[idx]
+		rv := reflect.ValueOf(record)
+		if rv.Kind() == reflect.Ptr {
+			rv = rv.Elem()
+		}
+
+		// Try each unique index until we find a match
+		var reloadedRecord T
+		found := false
+
+		for _, uniqueIndex := range ib.uniqueIndexes {
+			// Build WHERE clause for this unique index
+			// Use Model() instead of Table() to get correct table name from GORM's schema
+			query := db.Model(new(T))
+			allFieldsSet := true
+
+			for _, field := range uniqueIndex {
+				fieldValue := rv.FieldByName(field.Name)
+				if fieldValue.IsZero() {
+					// Can't use this index if any field is zero
+					allFieldsSet = false
+					break
+				}
+
+				columnName := getDBFieldName(field)
+				query = query.Where(fmt.Sprintf("%s = ?", columnName), fieldValue.Interface())
+			}
+
+			if !allFieldsSet {
+				continue
+			}
+
+			// Execute query
+			result := query.First(&reloadedRecord)
+			if result.Error == nil {
+				// Found the record, copy primary key fields back to original
+				reloadedRV := reflect.ValueOf(reloadedRecord)
+				if reloadedRV.Kind() == reflect.Ptr {
+					reloadedRV = reloadedRV.Elem()
+				}
+
+				// Update primary key fields in the original record
+				for _, pkField := range ib.primaryKeyFields {
+					pkValue := reloadedRV.FieldByName(pkField.Name)
+					rv.FieldByName(pkField.Name).Set(pkValue)
+				}
+
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("failed to reload record at index %d: no matching unique index found", idx)
+		}
+	}
+
+	return nil
 }

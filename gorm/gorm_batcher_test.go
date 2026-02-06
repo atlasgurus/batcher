@@ -34,6 +34,15 @@ type CompositeKeyModel struct {
 	MyValue int
 }
 
+// TestModelWithUniqueIndex has a unique constraint on Email field
+type TestModelWithUniqueIndex struct {
+	ID        uint   `gorm:"primaryKey"`
+	Email     string `gorm:"uniqueIndex;type:varchar(100)"`
+	Name      string `gorm:"type:varchar(100)"`
+	MyValue   int    `gorm:"type:int"`
+	UpdatedAt time.Time
+}
+
 var (
 	db      *gormv2.DB
 	dialect string
@@ -72,7 +81,7 @@ func TestMain(m *testing.M) {
 	}
 
 	// Migrate the schema
-	err = db.AutoMigrate(&TestModel{}, &CompositeKeyModel{})
+	err = db.AutoMigrate(&TestModel{}, &CompositeKeyModel{}, &TestModelWithUniqueIndex{})
 	if err != nil {
 		panic(fmt.Sprintf("failed to migrate database: %v", err))
 	}
@@ -1423,4 +1432,260 @@ func TestConnectionPoolPollution(t *testing.T) {
 			"Connection %d from pool should have default timeout (%d) but had %d",
 			i+1, defaultTimeout, currentTimeout)
 	}
+}
+
+// TestInsertBatcher_PureInsert_IDPopulation verifies that IDs are populated for pure inserts
+func TestInsertBatcher_PureInsert_IDPopulation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher := NewInsertBatcher[*TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// Insert models without IDs - they should get auto-incremented IDs
+	models := []*TestModel{
+		{Name: "Pure Insert 1", MyValue: 100},
+		{Name: "Pure Insert 2", MyValue: 200},
+		{Name: "Pure Insert 3", MyValue: 300},
+	}
+
+	err := batcher.Insert(models...)
+	assert.NoError(t, err)
+
+	// CRITICAL: Verify that all models have IDs populated
+	for i, model := range models {
+		assert.NotZero(t, model.ID, "Model %d should have ID populated after insert, but got 0", i)
+		t.Logf("Model %d: ID=%d, Name=%s", i, model.ID, model.Name)
+	}
+
+	// Verify records exist in database
+	var count int64
+	db.Model(&TestModel{}).Count(&count)
+	assert.Equal(t, int64(3), count)
+}
+
+// TestInsertBatcher_UpdateOnPrimaryKey_IDNotPopulated demonstrates the bug when
+// inserting a record with ID=0 but a duplicate primary key exists
+func TestInsertBatcher_UpdateOnPrimaryKey_IDNotPopulated(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher := NewInsertBatcher[*TestModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_models")
+
+	// First, insert a record directly with a known ID
+	existingModel := &TestModel{ID: 100, Name: "Existing Record", MyValue: 500}
+	result := db.Create(existingModel)
+	assert.NoError(t, result.Error)
+	assert.Equal(t, uint(100), existingModel.ID)
+
+	// Now try to insert a record with the same ID via batcher
+	// This should trigger IODKU and update the existing record
+	updateModel := &TestModel{ID: 100, Name: "Updated Record", MyValue: 600}
+	err := batcher.Insert(updateModel)
+	assert.NoError(t, err)
+
+	// The ID should remain 100 since we specified it
+	assert.Equal(t, uint(100), updateModel.ID, "ID should remain 100 when specified")
+
+	// Verify the record was updated in the database
+	var dbModel TestModel
+	db.First(&dbModel, 100)
+	assert.Equal(t, "Updated Record", dbModel.Name)
+	assert.Equal(t, 600, dbModel.MyValue)
+}
+
+// TestInsertBatcher_UpdateOnUniqueIndex_IDNotPopulated demonstrates the bug when
+// inserting a record with ID=0 but duplicate on a unique index
+func TestInsertBatcher_UpdateOnUniqueIndex_IDNotPopulated(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher := NewInsertBatcher[*TestModelWithUniqueIndex](getDBProvider(), 10, 100*time.Millisecond, ctx)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_model_with_unique_indices")
+
+	// First, insert a record with a unique email
+	existingModel := &TestModelWithUniqueIndex{
+		Email:   "user@example.com",
+		Name:    "Original User",
+		MyValue: 100,
+	}
+	result := db.Create(existingModel)
+	assert.NoError(t, result.Error)
+	assert.NotZero(t, existingModel.ID, "First insert should populate ID")
+	originalID := existingModel.ID
+	t.Logf("Original record created with ID=%d", originalID)
+
+	// Now try to insert a NEW record with ID=0 but the same email
+	// This should trigger IODKU and update the existing record
+	conflictModel := &TestModelWithUniqueIndex{
+		Email:   "user@example.com", // Same email - will conflict
+		Name:    "Updated User",
+		MyValue: 200,
+	}
+
+	err := batcher.Insert(conflictModel)
+	assert.NoError(t, err)
+
+	// BUG: The ID will be 0 because GORM can't populate it for IODKU updates
+	t.Logf("After insert with conflict: ID=%d (expected %d)", conflictModel.ID, originalID)
+
+	// This assertion will FAIL, demonstrating the bug
+	if conflictModel.ID == 0 {
+		t.Errorf("BUG CONFIRMED: ID is 0 after IODKU update on unique index. Expected ID=%d", originalID)
+	} else {
+		assert.Equal(t, originalID, conflictModel.ID, "ID should be populated with the existing record's ID")
+	}
+
+	// Verify in database that the record was updated, not inserted
+	var count int64
+	db.Model(&TestModelWithUniqueIndex{}).Count(&count)
+	assert.Equal(t, int64(1), count, "Should still have only 1 record (update, not insert)")
+
+	// Verify the record was updated
+	var dbModel TestModelWithUniqueIndex
+	db.Where("email = ?", "user@example.com").First(&dbModel)
+	assert.Equal(t, originalID, dbModel.ID)
+	assert.Equal(t, "Updated User", dbModel.Name)
+	assert.Equal(t, 200, dbModel.MyValue)
+}
+
+// TestInsertBatcher_CompositeKey_PureInsert tests composite keys on pure inserts
+func TestInsertBatcher_CompositeKey_PureInsert(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher := NewInsertBatcher[*CompositeKeyModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM composite_key_models")
+
+	// Insert models with composite keys
+	models := []*CompositeKeyModel{
+		{ID1: 1, ID2: "A", Name: "Composite 1", MyValue: 100},
+		{ID1: 1, ID2: "B", Name: "Composite 2", MyValue: 200},
+		{ID1: 2, ID2: "A", Name: "Composite 3", MyValue: 300},
+	}
+
+	err := batcher.Insert(models...)
+	assert.NoError(t, err)
+
+	// Composite keys are always specified, so they should remain unchanged
+	assert.Equal(t, 1, models[0].ID1)
+	assert.Equal(t, "A", models[0].ID2)
+	assert.Equal(t, 1, models[1].ID1)
+	assert.Equal(t, "B", models[1].ID2)
+	assert.Equal(t, 2, models[2].ID1)
+	assert.Equal(t, "A", models[2].ID2)
+
+	// Verify records exist in database
+	var count int64
+	db.Model(&CompositeKeyModel{}).Count(&count)
+	assert.Equal(t, int64(3), count)
+}
+
+// TestInsertBatcher_CompositeKey_Update tests composite keys on update (IODKU)
+func TestInsertBatcher_CompositeKey_Update(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher := NewInsertBatcher[*CompositeKeyModel](getDBProvider(), 10, 100*time.Millisecond, ctx)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM composite_key_models")
+
+	// First, insert a record
+	existingModel := &CompositeKeyModel{
+		ID1:     10,
+		ID2:     "X",
+		Name:    "Original",
+		MyValue: 500,
+	}
+	result := db.Create(existingModel)
+	assert.NoError(t, result.Error)
+
+	// Now insert again with same composite key - should trigger IODKU
+	updateModel := &CompositeKeyModel{
+		ID1:     10,
+		ID2:     "X",
+		Name:    "Updated",
+		MyValue: 600,
+	}
+
+	err := batcher.Insert(updateModel)
+	assert.NoError(t, err)
+
+	// Composite keys should remain unchanged
+	assert.Equal(t, 10, updateModel.ID1)
+	assert.Equal(t, "X", updateModel.ID2)
+
+	// Verify only 1 record exists (update, not insert)
+	var count int64
+	db.Model(&CompositeKeyModel{}).Count(&count)
+	assert.Equal(t, int64(1), count)
+
+	// Verify the record was updated
+	var dbModel CompositeKeyModel
+	db.Where("id1 = ? AND id2 = ?", 10, "X").First(&dbModel)
+	assert.Equal(t, "Updated", dbModel.Name)
+	assert.Equal(t, 600, dbModel.MyValue)
+}
+
+// TestInsertBatcher_MixedInsertAndUpdate tests a batch with both new inserts and updates
+func TestInsertBatcher_MixedInsertAndUpdate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batcher := NewInsertBatcher[*TestModelWithUniqueIndex](getDBProvider(), 10, 100*time.Millisecond, ctx)
+
+	// Clean up the table before the test
+	db.Exec("DELETE FROM test_model_with_unique_indices")
+
+	// First, insert a record
+	existingModel := &TestModelWithUniqueIndex{
+		Email:   "existing@example.com",
+		Name:    "Existing",
+		MyValue: 100,
+	}
+	result := db.Create(existingModel)
+	assert.NoError(t, result.Error)
+	existingID := existingModel.ID
+
+	// Now batch insert: one update (same email) and two new inserts
+	models := []*TestModelWithUniqueIndex{
+		{Email: "existing@example.com", Name: "Updated Existing", MyValue: 200}, // Should update
+		{Email: "new1@example.com", Name: "New User 1", MyValue: 300},           // Should insert
+		{Email: "new2@example.com", Name: "New User 2", MyValue: 400},           // Should insert
+	}
+
+	err := batcher.Insert(models...)
+	assert.NoError(t, err)
+
+	// Check results
+	t.Logf("After mixed batch:")
+	t.Logf("  Model 0 (update): ID=%d (expected %d)", models[0].ID, existingID)
+	t.Logf("  Model 1 (insert): ID=%d (expected non-zero)", models[1].ID)
+	t.Logf("  Model 2 (insert): ID=%d (expected non-zero)", models[2].ID)
+
+	// New inserts should have IDs
+	assert.NotZero(t, models[1].ID, "New insert should have ID populated")
+	assert.NotZero(t, models[2].ID, "New insert should have ID populated")
+
+	// BUG: Update will have ID=0
+	if models[0].ID == 0 {
+		t.Errorf("BUG CONFIRMED: Updated record has ID=0, expected %d", existingID)
+	} else {
+		assert.Equal(t, existingID, models[0].ID, "Updated record should have original ID")
+	}
+
+	// Verify we have 3 total records
+	var count int64
+	db.Model(&TestModelWithUniqueIndex{}).Count(&count)
+	assert.Equal(t, int64(3), count)
 }
