@@ -339,8 +339,11 @@ func getUniqueIndexes(t reflect.Type) [][]reflect.StructField {
 				tag = strings.TrimSpace(tag)
 				if strings.HasPrefix(tag, "uniqueIndex:") {
 					indexName = strings.TrimPrefix(tag, "uniqueIndex:")
-				} else if tag == "unique" || tag == "uniqueIndex" {
-					// Single field unique constraint
+				} else if strings.HasPrefix(tag, "unique_index:") {
+					// GORM v1 format
+					indexName = strings.TrimPrefix(tag, "unique_index:")
+				} else if tag == "unique" || tag == "uniqueIndex" || tag == "unique_index" {
+					// Single field unique constraint (both v1 and v2 formats)
 					indexName = field.Name
 				}
 			}
