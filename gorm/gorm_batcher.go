@@ -294,6 +294,8 @@ func getPrimaryKeyInfo(t reflect.Type) ([]reflect.StructField, []string, error) 
 	var primaryKeyNames []string
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
+
+		// Check if this field is a primary key
 		if isPrimaryKey(field) {
 			primaryKeyFields = append(primaryKeyFields, field)
 			columnName := field.Tag.Get("gorm")
@@ -303,6 +305,13 @@ func getPrimaryKeyInfo(t reflect.Type) ([]reflect.StructField, []string, error) 
 				columnName = toSnakeCase(field.Name)
 			}
 			primaryKeyNames = append(primaryKeyNames, columnName)
+		}
+
+		// Check embedded/anonymous structs (like gorm.Model)
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			embeddedPKFields, embeddedPKNames, _ := getPrimaryKeyInfo(field.Type)
+			primaryKeyFields = append(primaryKeyFields, embeddedPKFields...)
+			primaryKeyNames = append(primaryKeyNames, embeddedPKNames...)
 		}
 	}
 	if len(primaryKeyFields) == 0 {
@@ -323,6 +332,19 @@ func getUniqueIndexes(t reflect.Type) [][]reflect.StructField {
 
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
+
+		// Check embedded/anonymous structs recursively
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			embeddedUniqueIndexes := getUniqueIndexes(field.Type)
+			for _, embeddedFields := range embeddedUniqueIndexes {
+				// Use the first field's name as the index name for embedded fields
+				if len(embeddedFields) > 0 {
+					indexMap[embeddedFields[0].Name] = embeddedFields
+				}
+			}
+			continue
+		}
+
 		gormTag := field.Tag.Get("gorm")
 
 		// Skip primary keys
