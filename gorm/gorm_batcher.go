@@ -98,7 +98,7 @@ func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 
 func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 	// Perform reflection once if decomposition is enabled
-	var fieldToTypeMap map[string]reflect.Type // fieldName -> reflect.Type
+	var decomposed []decomposedField // in declaration order
 
 	if ib.config.DecomposeFields {
 		var model T
@@ -109,7 +109,6 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 
 		// Pre-compute field names and their types once
 		if modelType.Kind() == reflect.Struct {
-			fieldToTypeMap = make(map[string]reflect.Type)
 			for i := 0; i < modelType.NumField(); i++ {
 				field := modelType.Field(i)
 				if field.IsExported() {
@@ -119,7 +118,7 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 						ib.validationError = fmt.Errorf("field %s of type %s cannot be interfaced for decomposition", field.Name, field.Type)
 						break
 					}
-					fieldToTypeMap[field.Name] = field.Type
+					decomposed = append(decomposed, decomposedField{name: field.Name, typ: field.Type})
 				}
 			}
 		}
@@ -158,7 +157,7 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 
 		err := retryWithDeadlockDetection(maxRetries, ib.timeout, ib.dbProvider, func(tx *gorm.DB) error {
 			if ib.config.DecomposeFields {
-				return insertByFields(tx, allRecords, fieldToTypeMap)
+				return insertByFields(tx, allRecords, decomposed)
 			} else {
 				// Build OnConflict clause with proper conflict targets
 				onConflict := ib.buildOnConflictClause(tx)
@@ -183,13 +182,24 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 	}
 }
 
-func insertByFields[T any](tx *gorm.DB, records []T, fieldToTypeMap map[string]reflect.Type) error {
+// decomposedField is one field of a model whose fields are inserted into their
+// own tables.
+type decomposedField struct {
+	name string
+	typ  reflect.Type
+}
+
+// insertByFields inserts each field's value into the table of its type, one
+// type at a time, in the order the fields are declared, so a parent declared
+// before its child is written first.
+func insertByFields[T any](tx *gorm.DB, records []T, fields []decomposedField) error {
 	if len(records) == 0 {
 		return nil
 	}
 
-	// Group model instances by their precomputed reflect.Type
+	// Group model instances by type, keeping the order types first appear in.
 	typeBatches := make(map[reflect.Type][]interface{})
+	var typeOrder []reflect.Type
 
 	for _, record := range records {
 		rv := reflect.ValueOf(record)
@@ -197,19 +207,21 @@ func insertByFields[T any](tx *gorm.DB, records []T, fieldToTypeMap map[string]r
 			rv = rv.Elem()
 		}
 
-		// Use precomputed field-to-type mapping - all fields should be valid
-		for fieldName, fieldType := range fieldToTypeMap {
-			fieldValue := rv.FieldByName(fieldName)
+		for _, f := range fields {
+			fieldValue := rv.FieldByName(f.name)
 			if !fieldValue.IsValid() {
-				return fmt.Errorf("field %s is not valid on record instance", fieldName)
+				return fmt.Errorf("field %s is not valid on record instance", f.name)
 			}
-			modelInstance := fieldValue.Interface()
-			typeBatches[fieldType] = append(typeBatches[fieldType], modelInstance)
+			if _, seen := typeBatches[f.typ]; !seen {
+				typeOrder = append(typeOrder, f.typ)
+			}
+			typeBatches[f.typ] = append(typeBatches[f.typ], fieldValue.Interface())
 		}
 	}
 
 	// Insert each type batch separately within the same transaction
-	for modelType, modelInstances := range typeBatches {
+	for _, modelType := range typeOrder {
+		modelInstances := typeBatches[modelType]
 		if len(modelInstances) > 0 {
 			// Deduplicate child records by their primary keys
 			deduplicatedInstances := deduplicateChildRecords(modelInstances, modelType)
@@ -919,39 +931,33 @@ func buildCompositeKey(itemValue reflect.Value, primaryKeyFields []reflect.Struc
 	return strings.Join(keyParts, "-"), true
 }
 
-// deduplicateRecords is the core deduplication logic that works with any record type
-// It deduplicates records by primary key (last value wins) and preserves records with zero PKs
+// deduplicateRecords keeps one record per primary key, the last one given, at
+// the position where that key first appeared. Records with a zero primary key
+// get one generated and are kept as they are, in their own positions. The
+// order is deterministic, so concurrent batches touching the same rows lock
+// them in the same order.
 func deduplicateRecords[T any](records []T, primaryKeyFields []reflect.StructField) []T {
 	if len(primaryKeyFields) == 0 {
 		// No primary key, cannot deduplicate
 		return records
 	}
 
-	// Track the latest value for each primary key
-	latestRecords := make(map[string]T)
-	var recordsWithoutPK []T
-
+	deduplicated := make([]T, 0, len(records))
+	position := make(map[string]int)
 	for _, record := range records {
 		compositeKey, hasKey := buildCompositeKey(reflect.ValueOf(record), primaryKeyFields)
-
 		if !hasKey {
-			// Zero PK - will be auto-generated, don't deduplicate
-			recordsWithoutPK = append(recordsWithoutPK, record)
+			deduplicated = append(deduplicated, record)
 			continue
 		}
-
-		// Keep the latest value (last one wins)
-		latestRecords[compositeKey] = record
+		if i, seen := position[compositeKey]; seen {
+			deduplicated[i] = record // last value wins, first position kept
+			continue
+		}
+		position[compositeKey] = len(deduplicated)
+		deduplicated = append(deduplicated, record)
 	}
-
-	// Convert back to slice: deduplicated records + records without PK
-	deduplicatedRecords := make([]T, 0, len(latestRecords)+len(recordsWithoutPK))
-	for _, record := range latestRecords {
-		deduplicatedRecords = append(deduplicatedRecords, record)
-	}
-	deduplicatedRecords = append(deduplicatedRecords, recordsWithoutPK...)
-
-	return deduplicatedRecords
+	return deduplicated
 }
 
 func deduplicateChildRecords(instances []interface{}, modelType reflect.Type) []interface{} {
