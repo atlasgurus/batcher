@@ -1689,3 +1689,99 @@ func TestInsertBatcher_MixedInsertAndUpdate(t *testing.T) {
 	db.Model(&TestModelWithUniqueIndex{}).Count(&count)
 	assert.Equal(t, int64(3), count)
 }
+
+// updateSameRowInOneBatch submits each update for the same row back to back,
+// with a wait window long enough that they all land in one batch, and waits for
+// every callback.
+func updateSameRowInOneBatch(t *testing.T, updates ...UpdateItem[*TestModel]) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, err := NewUpdateBatcher[*TestModel](getDBProvider(), 100, time.Second, ctx)
+	assert.NoError(t, err)
+
+	var wg sync.WaitGroup
+	for _, u := range updates {
+		wg.Add(1)
+		b.UpdateAsync(func(err error) {
+			assert.NoError(t, err)
+			wg.Done()
+		}, []*TestModel{u.Item}, u.UpdateFields)
+	}
+	wg.Wait()
+}
+
+func seedOneModel(t *testing.T) TestModel {
+	t.Helper()
+	db.Exec("DELETE FROM test_models")
+	m := TestModel{Name: "original", MyValue: 1}
+	assert.NoError(t, db.Create(&m).Error)
+	return m
+}
+
+func readModel(t *testing.T, id uint) TestModel {
+	t.Helper()
+	var m TestModel
+	assert.NoError(t, db.First(&m, id).Error)
+	return m
+}
+
+// Two callers update different fields of the same row. Each field must end up
+// with the value its own caller set, not the other caller's struct value.
+func TestUpdateBatcher_SameRowDifferentFieldsInOneBatch(t *testing.T) {
+	m := seedOneModel(t)
+	first := &TestModel{ID: m.ID, Name: "renamed"}
+	second := &TestModel{ID: m.ID, MyValue: 42}
+	updateSameRowInOneBatch(t,
+		UpdateItem[*TestModel]{Item: first, UpdateFields: []string{"Name"}},
+		UpdateItem[*TestModel]{Item: second, UpdateFields: []string{"MyValue"}},
+	)
+
+	got := readModel(t, m.ID)
+	assert.Equal(t, "renamed", got.Name, "the first caller's field keeps its value")
+	assert.Equal(t, 42, got.MyValue, "the second caller's field keeps its value")
+	assert.Equal(t, &TestModel{ID: m.ID, Name: "renamed"}, first, "the caller's struct is not modified")
+	assert.Equal(t, &TestModel{ID: m.ID, MyValue: 42}, second, "the caller's struct is not modified")
+}
+
+// An update of every field followed by an update of one field, named by its
+// column. The first update's other fields must still be written.
+func TestUpdateBatcher_SameRowAllFieldsThenOneInOneBatch(t *testing.T) {
+	m := seedOneModel(t)
+	updateSameRowInOneBatch(t,
+		UpdateItem[*TestModel]{Item: &TestModel{ID: m.ID, Name: "all", MyValue: 5}},
+		UpdateItem[*TestModel]{Item: &TestModel{ID: m.ID, MyValue: 7}, UpdateFields: []string{"my_value"}},
+	)
+
+	got := readModel(t, m.ID)
+	assert.Equal(t, "all", got.Name, "the full update's other fields are written")
+	assert.Equal(t, 7, got.MyValue, "the later single-field update wins its field")
+}
+
+// An update of one field followed by an update of every field: the later full
+// update wins every field.
+func TestUpdateBatcher_SameRowOneThenAllFieldsInOneBatch(t *testing.T) {
+	m := seedOneModel(t)
+	updateSameRowInOneBatch(t,
+		UpdateItem[*TestModel]{Item: &TestModel{ID: m.ID, Name: "partial"}, UpdateFields: []string{"Name"}},
+		UpdateItem[*TestModel]{Item: &TestModel{ID: m.ID, Name: "all", MyValue: 9}},
+	)
+
+	got := readModel(t, m.ID)
+	assert.Equal(t, "all", got.Name)
+	assert.Equal(t, 9, got.MyValue)
+}
+
+// Two updates of the same field, one by struct name and one by column name:
+// the later one wins.
+func TestUpdateBatcher_SameRowSameFieldInOneBatch(t *testing.T) {
+	m := seedOneModel(t)
+	updateSameRowInOneBatch(t,
+		UpdateItem[*TestModel]{Item: &TestModel{ID: m.ID, MyValue: 3}, UpdateFields: []string{"MyValue"}},
+		UpdateItem[*TestModel]{Item: &TestModel{ID: m.ID, MyValue: 4}, UpdateFields: []string{"my_value"}},
+	)
+
+	got := readModel(t, m.ID)
+	assert.Equal(t, "original", got.Name, "an untouched field keeps its value")
+	assert.Equal(t, 4, got.MyValue, "the later update of the field wins")
+}
