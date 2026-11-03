@@ -17,6 +17,7 @@ import (
 	_ "github.com/jinzhu/gorm/dialects/mysql"
 	_ "github.com/jinzhu/gorm/dialects/postgres"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	gormv2 "gorm.io/gorm"
 )
 
@@ -1784,4 +1785,48 @@ func TestUpdateBatcher_SameRowSameFieldInOneBatch(t *testing.T) {
 	got := readModel(t, m.ID)
 	assert.Equal(t, "original", got.Name, "an untouched field keeps its value")
 	assert.Equal(t, 4, got.MyValue, "the later update of the field wins")
+}
+
+// When the ids of committed rows cannot be verified afterwards, the error must
+// say the rows were written, so a caller can tell it apart from a failed insert
+// and not retry into duplicates. A record whose unique-index fields are empty
+// cannot be looked up.
+func TestInsertBatcher_UnverifiableIDsAfterCommitAreReportedAsCommitted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db.Exec("DELETE FROM test_model_with_unique_indices")
+
+	b := NewInsertBatcher[*TestModelWithUniqueIndex](getDBProvider(), 10, 10*time.Millisecond, ctx)
+	err := b.Insert(&TestModelWithUniqueIndex{Name: "no email", MyValue: 1})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInsertCommittedIDsUnverified)
+	var count int64
+	db.Model(&TestModelWithUniqueIndex{}).Where("name = ?", "no email").Count(&count)
+	assert.Equal(t, int64(1), count, "the row was committed")
+}
+
+// A database error while reloading ids is reported as that error, not mistaken
+// for a missing row.
+func TestInsertBatcher_ReloadDatabaseErrorIsReported(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db.Exec("DELETE FROM test_model_with_unique_indices")
+
+	calls := 0
+	provider := func() (*gormv2.DB, error) {
+		calls++
+		if calls == 1 {
+			return db, nil // the insert itself
+		}
+		canceled, cancelReload := context.WithCancel(context.Background())
+		cancelReload()
+		return db.WithContext(canceled), nil // the reload
+	}
+	b := NewInsertBatcher[*TestModelWithUniqueIndex](provider, 10, 10*time.Millisecond, ctx)
+	err := b.Insert(&TestModelWithUniqueIndex{Email: "reload@example.com", Name: "reload", MyValue: 1})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInsertCommittedIDsUnverified)
+	assert.ErrorIs(t, err, context.Canceled, "the reload's own error is kept")
 }
