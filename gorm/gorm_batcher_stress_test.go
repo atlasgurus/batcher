@@ -53,6 +53,10 @@ func testStressUpdates(t *testing.T, numIDs int) {
 	numRoutines := 1000
 	updatesPerRoutine := 20
 	var wg sync.WaitGroup
+	// written counts writes still in flight. The test waits for them too, so
+	// it does not return while its batchers still hold connections that the
+	// next test needs, or log after it has finished.
+	var written sync.WaitGroup
 	var updateErrors int32
 	start := time.Now()
 
@@ -78,7 +82,9 @@ func testStressUpdates(t *testing.T, numIDs int) {
 				}
 				updates = append(updates, model)
 
+				written.Add(1)
 				batcher.UpdateAsync(func(err error) {
+					defer written.Done()
 					if err != nil {
 						atomic.AddInt32(&updateErrors, 1)
 						t.Logf("Case-Update error: %v", err)
@@ -90,6 +96,7 @@ func testStressUpdates(t *testing.T, numIDs int) {
 	}
 
 	wg.Wait()
+	written.Wait()
 	duration := time.Since(start)
 
 	assert.Zero(t, atomic.LoadInt32(&updateErrors))

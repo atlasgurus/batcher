@@ -66,6 +66,9 @@ type MemoMetrics struct {
 	TotalItems int
 }
 
+// MetricsCollector receives the cache's metrics after every call. Collect runs
+// under the cache's lock, one call at a time, so it must not call the memoized
+// function.
 type MetricsCollector interface {
 	Setup(function interface{})
 	Collect(metrics *MemoMetrics)
@@ -204,7 +207,12 @@ func MemoizeWithInvalidate[F any](f F, options ...Option) (F, func()) {
 	wrapped := reflect.MakeFunc(ft, func(args []reflect.Value) []reflect.Value {
 		defer func() {
 			if opts.metrics != nil {
+				// Under the mutex: TotalItems is written under it, and a
+				// collector need not be safe for concurrent use. A collector
+				// must therefore not call the memoized function.
+				mutex.Lock()
 				opts.metrics.Collect(metrics)
+				mutex.Unlock()
 			}
 		}()
 
