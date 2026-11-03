@@ -78,6 +78,7 @@ func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 	ib := &InsertBatcher[T]{
 		dbProvider: dbProvider,
 		config:     &config,
+		timeout:    config.Timeout,
 		tableName:  getTableNameFromType(modelType),
 	}
 
@@ -1441,17 +1442,32 @@ func retryWithDeadlockDetection(maxRetries int, timeout int, dbProvider DBProvid
 		// Create a session within transaction to avoid updating the global session
 		sessionDB := tx.Session(&gorm.Session{})
 
+		// The lock wait timeout is a session variable, so it stays on the
+		// pooled connection after this transaction. It is restored to the
+		// session's previous value on every path out of the transaction,
+		// before the connection goes back to the pool.
+		restoreTimeout := func() {}
 		if timeout > 0 && db.Dialector.Name() == "mysql" {
-			// Set lock wait timeout for this session
+			var previous int
+			if readErr := sessionDB.Raw("SELECT @@SESSION.innodb_lock_wait_timeout").Scan(&previous).Error; readErr != nil {
+				sessionDB.Rollback()
+				return fmt.Errorf("failed to read session timeout: %w", readErr)
+			}
 			if timeoutSetErr := sessionDB.Exec(fmt.Sprintf("SET SESSION innodb_lock_wait_timeout = %d", timeout)).Error; timeoutSetErr != nil {
 				sessionDB.Rollback()
 				return fmt.Errorf("failed to set session timeout: %w", timeoutSetErr)
+			}
+			restoreTimeout = func() {
+				if resetErr := sessionDB.Exec(fmt.Sprintf("SET SESSION innodb_lock_wait_timeout = %d", previous)).Error; resetErr != nil {
+					fmt.Printf("Warning: failed to reset session timeout: %v\n", resetErr)
+				}
 			}
 		}
 
 		// Execute the operation
 		err = operation(sessionDB)
 		if err != nil {
+			restoreTimeout()
 			sessionDB.Rollback()
 			if !isDeadlockError(err) {
 				return fmt.Errorf("operation failed: %w", err)
@@ -1462,13 +1478,8 @@ func retryWithDeadlockDetection(maxRetries int, timeout int, dbProvider DBProvid
 			continue
 		}
 
-		// Reset timeout before committing, so we can still use the session
-		if timeout > 0 && db.Dialector.Name() == "mysql" {
-			if resetErr := sessionDB.Exec("SET SESSION innodb_lock_wait_timeout = DEFAULT").Error; resetErr != nil {
-				// Log the error but don't fail the operation
-				fmt.Printf("Warning: failed to reset session timeout: %v\n", resetErr)
-			}
-		}
+		// Restore before committing, while the session is still ours.
+		restoreTimeout()
 
 		// Commit the transaction
 		if err = sessionDB.Commit().Error; err != nil {
