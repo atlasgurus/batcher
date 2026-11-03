@@ -614,3 +614,60 @@ func TestShutdownLosesNothingUnderConcurrentSubmits(t *testing.T) {
 		mu.Unlock()
 	}
 }
+
+// A processFn that panics runs on the batcher's own goroutine, where nothing
+// recovers it, so it used to crash the process. Every caller in the batch now
+// gets an error carrying the panic, and the batcher keeps working.
+func TestProcessFnPanicBecomesAnErrorForEveryCaller(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls int
+	processor := NewBatchProcessor(
+		2,
+		50*time.Millisecond,
+		ctx,
+		func(items []int) []error {
+			calls++
+			if calls == 1 {
+				panic("bad batch")
+			}
+			return make([]error, len(items))
+		},
+	)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = processor.SubmitAndWait(i)
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		var pe *PanicError
+		require.ErrorAs(t, err, &pe, "caller %d", i)
+		assert.Equal(t, "bad batch", pe.Value)
+		assert.NotEmpty(t, pe.Stack)
+	}
+
+	assert.NoError(t, processor.SubmitAndWait(3), "the batcher still processes later batches")
+}
+
+// A processFn that returns the wrong number of errors used to index past the
+// end of its result, a panic on the batcher's goroutine. Every caller now gets
+// an error instead.
+func TestProcessFnWrongErrorCountBecomesAnError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	processor := NewBatchProcessor(
+		1,
+		time.Millisecond,
+		ctx,
+		func(items []int) []error { return nil },
+	)
+	err := processor.SubmitAndWait(1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "returned 0 errors for 1 items")
+}
