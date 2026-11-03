@@ -10,13 +10,19 @@ import (
 	"time"
 )
 
+// cacheEntry is one key's value, or the computation producing it. Callers that
+// find an entry still computing wait on ready, which the computing caller
+// closes however the computation ends.
 type cacheEntry struct {
 	key       string
 	result    []reflect.Value
 	ready     chan struct{}
-	expireAt  time.Time
+	expireAt  time.Time // set when the value is ready; meaningless while computing
 	element   *list.Element
 	computing bool
+	// failed means the computation panicked and produced no result; callers
+	// waiting on it compute again.
+	failed bool
 }
 
 type Option func(*memoizeOptions)
@@ -122,17 +128,77 @@ func MemoizeWithInvalidate[F any](f F, options ...Option) (F, func()) {
 		hasErrorReturn = lastReturn.Implements(reflect.TypeOf((*error)(nil)).Elem())
 	}
 
+	// An entry is in the cache exactly while cache[key] points at its list
+	// element; the map and the list change together, under mutex. A
+	// computation that finishes after its entry was invalidated, expired or
+	// evicted therefore finds that it no longer owns it, and leaves the cache
+	// alone. Removing an element that is not in lru would corrupt the list.
+	owned := func(entry *cacheEntry) bool {
+		return cache[entry.key] == entry.element
+	}
+	remove := func(entry *cacheEntry) {
+		lru.Remove(entry.element)
+		delete(cache, entry.key)
+	}
+
+	// cleanup evicts entries over the size limit, then expired ones, oldest
+	// first. An entry still computing has no value to expire.
 	cleanup := func() {
 		now := time.Now()
-		for lru.Len() > opts.maxSize || (lru.Len() > 0 && now.After(lru.Back().Value.(*cacheEntry).expireAt)) {
-			oldest := lru.Back()
-			if oldest != nil {
-				lru.Remove(oldest)
-				delete(cache, oldest.Value.(*cacheEntry).key)
-				metrics.Evictions.Add(1)
+		for lru.Len() > 0 {
+			oldest := lru.Back().Value.(*cacheEntry)
+			if lru.Len() <= opts.maxSize && (oldest.computing || now.Before(oldest.expireAt)) {
+				break
 			}
+			remove(oldest)
+			metrics.Evictions.Add(1)
 		}
 		metrics.TotalItems = lru.Len()
+	}
+
+	fv := reflect.ValueOf(f)
+
+	// compute runs f for an entry this caller created, stores the result if it
+	// is to be kept and the entry is still the cache's, and releases waiters.
+	compute := func(entry *cacheEntry, args []reflect.Value) []reflect.Value {
+		returned := false
+		defer func() {
+			if returned {
+				return
+			}
+			// f panicked. Forget the entry and release the waiters, which
+			// compute again; the panic continues to this caller.
+			mutex.Lock()
+			entry.failed = true
+			entry.computing = false
+			if owned(entry) {
+				remove(entry)
+			}
+			close(entry.ready)
+			mutex.Unlock()
+		}()
+		result := fv.Call(args)
+		returned = true
+
+		keep := !hasErrorReturn || opts.memoizeErrors || result[len(result)-1].IsNil()
+
+		mutex.Lock()
+		entry.result = result
+		entry.computing = false
+		if owned(entry) {
+			if keep {
+				entry.expireAt = time.Now().Add(opts.expiration)
+			} else {
+				remove(entry)
+			}
+		}
+		// Waiters get this result even when it is an error that is not kept.
+		close(entry.ready)
+		cleanup()
+		mutex.Unlock()
+
+		metrics.Misses.Add(1)
+		return result
 	}
 
 	wrapped := reflect.MakeFunc(ft, func(args []reflect.Value) []reflect.Value {
@@ -144,63 +210,34 @@ func MemoizeWithInvalidate[F any](f F, options ...Option) (F, func()) {
 
 		key := makeKey(args, opts.ignoreParams)
 
-		mutex.Lock()
-		element, found := cache[key]
-		now := time.Now()
-
-		if found {
-			entry := element.Value.(*cacheEntry)
-			if now.Before(entry.expireAt) {
-				lru.MoveToFront(element)
-				readyChan := entry.ready
-				mutex.Unlock()
-				<-readyChan // Wait for the result to be ready
-				metrics.Hits.Add(1)
-				return entry.result
-			}
-			// Entry has expired, remove it
-			lru.Remove(element)
-			delete(cache, key)
-		}
-
-		// Create a new entry or reuse the expired one
-		entry := &cacheEntry{
-			key:       key,
-			ready:     make(chan struct{}),
-			computing: true,
-			expireAt:  now.Add(opts.expiration),
-		}
-		element = lru.PushFront(entry)
-		cache[key] = element
-		mutex.Unlock()
-
-		// Compute the result
-		result := reflect.ValueOf(f).Call(args)
-
-		// Check if result has error and if we should skip memoization
-		shouldMemoize := true
-		if hasErrorReturn && !opts.memoizeErrors {
-			if !result[len(result)-1].IsNil() {
-				shouldMemoize = false
-			}
-		}
-
-		if shouldMemoize {
+		for {
 			mutex.Lock()
-			entry.result = result
-			entry.computing = false
-			cleanup()          // Clean up after adding new entry
-			close(entry.ready) // Signal that the result is ready
-			mutex.Unlock()
-		} else {
-			mutex.Lock()
-			delete(cache, key)
-			lru.Remove(element)
-			mutex.Unlock()
-		}
+			if element, found := cache[key]; found {
+				entry := element.Value.(*cacheEntry)
+				if entry.computing || time.Now().Before(entry.expireAt) {
+					lru.MoveToFront(element)
+					mutex.Unlock()
+					<-entry.ready
+					if entry.failed {
+						continue // the computation panicked; compute again
+					}
+					metrics.Hits.Add(1)
+					return entry.result
+				}
+				remove(entry) // expired
+			}
 
-		metrics.Misses.Add(1)
-		return result
+			entry := &cacheEntry{
+				key:       key,
+				ready:     make(chan struct{}),
+				computing: true,
+			}
+			entry.element = lru.PushFront(entry)
+			cache[key] = entry.element
+			mutex.Unlock()
+
+			return compute(entry, args)
+		}
 	})
 
 	invalidate := func() {

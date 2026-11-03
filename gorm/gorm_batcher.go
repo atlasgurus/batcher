@@ -3,6 +3,7 @@ package gorm
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -18,6 +19,12 @@ import (
 
 // DBProvider is a function type that returns the current database connection and an error
 type DBProvider func() (*gorm.DB, error)
+
+// ErrInsertCommittedIDsUnverified reports that an insert batch was committed
+// but the ids of some of its records could not be read back afterwards, so
+// those records may carry wrong ids. The rows are in the database: a caller
+// that retries on this error inserts them again. Test for it with errors.Is.
+var ErrInsertCommittedIDsUnverified = errors.New("batcher: insert committed, but record ids could not be verified")
 
 // InsertBatcher is a GORM batcher for batch inserts
 type InsertBatcher[T any] struct {
@@ -167,7 +174,7 @@ func (ib *InsertBatcher[T]) createBatchInsertFunc() func([][]T) []error {
 		// We must reload these records from the database to get correct IDs
 		if len(recordsNeedingReload) > 0 && len(ib.uniqueIndexes) > 0 {
 			if reloadErr := ib.reloadRecordsByUniqueIndexes(allRecords, recordsNeedingReload); reloadErr != nil {
-				return batcher.RepeatErr(len(batches), fmt.Errorf("failed to reload IDs after insert: %w", reloadErr))
+				return batcher.RepeatErr(len(batches), fmt.Errorf("%w: %w", ErrInsertCommittedIDsUnverified, reloadErr))
 			}
 		}
 
@@ -1606,6 +1613,10 @@ func (ib *InsertBatcher[T]) reloadRecordsByUniqueIndexes(allRecords []T, recordI
 
 			// Execute query
 			result := query.First(&reloadedRecord)
+			if result.Error != nil && !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+				// A database error says nothing about whether the row exists.
+				return fmt.Errorf("reload record at index %d: %w", idx, result.Error)
+			}
 			if result.Error == nil {
 				// Found the record, copy primary key fields back to original
 				reloadedRV := reflect.ValueOf(reloadedRecord)

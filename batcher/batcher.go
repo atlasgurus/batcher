@@ -2,9 +2,39 @@ package batcher
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 )
+
+// PanicError is the error every caller in a batch receives when processFn
+// panics. processFn runs on the batcher's own goroutine, where an unrecovered
+// panic would end the whole process.
+type PanicError struct {
+	Value any    // the value passed to panic
+	Stack []byte // the stack of the panicking goroutine
+}
+
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("batcher: processFn panicked: %v", e.Value)
+}
+
+// process calls processFn and guarantees one error per item: a panic becomes a
+// *PanicError for every item, and a result of the wrong length becomes an error
+// for every item.
+func (bp *BatchProcessor[T]) process(items []T) (errs []error) {
+	defer func() {
+		if r := recover(); r != nil {
+			errs = RepeatErr(len(items), &PanicError{Value: r, Stack: debug.Stack()})
+		}
+	}()
+	errs = bp.processFn(items)
+	if len(errs) != len(items) {
+		return RepeatErr(len(items), fmt.Errorf("batcher: processFn returned %d errors for %d items", len(errs), len(items)))
+	}
+	return errs
+}
 
 // MetricsCollector defines the interface for collecting batch processing metrics
 type MetricsCollector interface {
@@ -164,7 +194,7 @@ func (bp *BatchProcessor[T]) SubmitAndWait(item T) error {
 		return <-respChan
 	}
 	// Process the item directly when the context is canceled
-	return bp.processFn([]T{item})[0]
+	return bp.process([]T{item})[0]
 }
 
 // Submit submits an item for processing and calls the callback function when
@@ -179,7 +209,7 @@ func (bp *BatchProcessor[T]) Submit(item T, callback func(error)) {
 		return
 	}
 	go func() {
-		callback(bp.processFn([]T{item})[0])
+		callback(bp.process([]T{item})[0])
 	}()
 }
 
@@ -202,7 +232,7 @@ func (bp *BatchProcessor[T]) run() {
 			return
 		}
 		startTime := time.Now()
-		errs := bp.processFn(batch)
+		errs := bp.process(batch)
 		for i, ch := range respChans {
 			ch <- errs[i]
 		}
