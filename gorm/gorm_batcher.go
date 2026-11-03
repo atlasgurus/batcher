@@ -10,11 +10,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/atlasgurus/batcher/batcher"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/schema"
 )
 
 // DBProvider is a function type that returns the current database connection and an error
@@ -34,8 +34,10 @@ type InsertBatcher[T any] struct {
 	validationError  error
 	timeout          int
 	primaryKeyFields []reflect.StructField
-	uniqueIndexes    [][]reflect.StructField // Each element is a set of fields forming a unique index
-	tableName        string
+	// uniqueIndexes are the model's unique indexes as parsed when the batcher
+	// was created. Reloading ids re-reads them with the database's naming.
+	uniqueIndexes [][]*schema.Field
+	models        modelCache
 }
 
 func (ib *InsertBatcher[T]) Error() error {
@@ -46,7 +48,6 @@ func (ib *InsertBatcher[T]) Error() error {
 type UpdateBatcher[T any] struct {
 	dbProvider DBProvider
 	batcher    batcher.BatchProcessorInterface[[]UpdateItem[T]]
-	tableName  string
 }
 
 type UpdateItem[T any] struct {
@@ -79,18 +80,15 @@ func NewInsertBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 		dbProvider: dbProvider,
 		config:     &config,
 		timeout:    config.Timeout,
-		tableName:  getTableNameFromType(modelType),
 	}
 
-	// Get primary key fields for deduplication (if available)
-	primaryKeyFields, _, keyErr := getPrimaryKeyInfo(modelType)
-	if keyErr == nil {
-		// Only set if primary key exists, otherwise deduplication will be skipped
-		ib.primaryKeyFields = primaryKeyFields
+	// Primary key fields drive deduplication, and unique indexes drive id
+	// reloading after an upsert. A model GORM cannot parse, such as a
+	// decomposed wrapper of several models, has neither.
+	if info, err := parseModel(nil, modelType); err == nil {
+		ib.primaryKeyFields = info.primaryKeyStructFields()
+		ib.uniqueIndexes = info.uniqueIndexes
 	}
-
-	// Get unique index fields for ID reloading after IODKU
-	ib.uniqueIndexes = getUniqueIndexes(modelType)
 
 	ib.batcher = batcher.NewBatchProcessorWithOptions(ctx, ib.createBatchInsertFunc(), opts...)
 	return ib
@@ -248,27 +246,6 @@ func insertByFields[T any](tx *gorm.DB, records []T, fields []decomposedField) e
 	return nil
 }
 
-// Helper function to get table name from struct type
-func getTableName[T any]() string {
-	var model T
-	return getTableNameFromType(reflect.TypeOf(model))
-}
-
-func getTableNameFromType(fieldType reflect.Type) string {
-	// Handle pointer types
-	if fieldType.Kind() == reflect.Ptr {
-		fieldType = fieldType.Elem()
-	}
-
-	// Check if the type implements TableName method
-	if tn, ok := reflect.New(fieldType).Interface().(interface{ TableName() string }); ok {
-		return tn.TableName()
-	}
-
-	// Default to struct name converted to snake case plural
-	return toSnakeCase(fieldType.Name()) + "s"
-}
-
 // Legacy constructor calls the new options-based one
 func NewUpdateBatcher[T any](dbProvider DBProvider, maxBatchSize int, maxWaitTime time.Duration, ctx context.Context) (*UpdateBatcher[T], error) {
 	return NewUpdateBatcherWithOptions[T](
@@ -287,122 +264,19 @@ func NewUpdateBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 		opt(&config)
 	}
 
-	tableName := getTableName[T]()
 	var model T
-	primaryKeyField, primaryKeyName, keyErr := getPrimaryKeyInfo(reflect.TypeOf(model))
-	if keyErr != nil {
-		return nil, keyErr
+	info, err := parseModel(nil, reflect.TypeOf(model))
+	if err != nil {
+		return nil, err
+	}
+	if len(info.primaryKeys) == 0 {
+		return nil, fmt.Errorf("no primary key found for type %v", reflect.TypeOf(model))
 	}
 
 	return &UpdateBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchUpdate[T](dbProvider, tableName, primaryKeyField, primaryKeyName, config.Timeout), opts...),
-		tableName:  tableName,
+		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchUpdate[T](dbProvider, config.Timeout), opts...),
 	}, nil
-}
-
-func isPrimaryKey(field reflect.StructField) bool {
-	gormTag := field.Tag.Get("gorm")
-	return strings.Contains(gormTag, "primaryKey") || strings.Contains(gormTag, "primary_key")
-}
-
-func getPrimaryKeyInfo(t reflect.Type) ([]reflect.StructField, []string, error) {
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	var primaryKeyFields []reflect.StructField
-	var primaryKeyNames []string
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-
-		// Check if this field is a primary key
-		if isPrimaryKey(field) {
-			primaryKeyFields = append(primaryKeyFields, field)
-			columnName := field.Tag.Get("gorm")
-			if strings.Contains(columnName, "column:") {
-				columnName = strings.Split(strings.Split(columnName, "column:")[1], ";")[0]
-			} else {
-				columnName = toSnakeCase(field.Name)
-			}
-			primaryKeyNames = append(primaryKeyNames, columnName)
-		}
-
-		// Check embedded/anonymous structs (like gorm.Model)
-		if field.Anonymous && field.Type.Kind() == reflect.Struct {
-			embeddedPKFields, embeddedPKNames, _ := getPrimaryKeyInfo(field.Type)
-			primaryKeyFields = append(primaryKeyFields, embeddedPKFields...)
-			primaryKeyNames = append(primaryKeyNames, embeddedPKNames...)
-		}
-	}
-	if len(primaryKeyFields) == 0 {
-		return nil, nil, fmt.Errorf("no primary key found for type %v", t)
-	}
-	return primaryKeyFields, primaryKeyNames, nil
-}
-
-// getUniqueIndexes returns all unique indexes defined on the struct
-// Each element in the returned slice is a set of fields that form a unique constraint
-func getUniqueIndexes(t reflect.Type) [][]reflect.StructField {
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	// Map of index name to fields
-	indexMap := make(map[string][]reflect.StructField)
-
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-
-		// Check embedded/anonymous structs recursively
-		if field.Anonymous && field.Type.Kind() == reflect.Struct {
-			embeddedUniqueIndexes := getUniqueIndexes(field.Type)
-			for _, embeddedFields := range embeddedUniqueIndexes {
-				// Use the first field's name as the index name for embedded fields
-				if len(embeddedFields) > 0 {
-					indexMap[embeddedFields[0].Name] = embeddedFields
-				}
-			}
-			continue
-		}
-
-		gormTag := field.Tag.Get("gorm")
-
-		// Skip primary keys
-		if isPrimaryKey(field) {
-			continue
-		}
-
-		// Check for unique or uniqueIndex tags
-		if strings.Contains(gormTag, "unique") || strings.Contains(gormTag, "uniqueIndex") {
-			// Parse the tag to get index name
-			indexName := ""
-			tags := strings.Split(gormTag, ";")
-			for _, tag := range tags {
-				tag = strings.TrimSpace(tag)
-				if strings.HasPrefix(tag, "uniqueIndex:") {
-					indexName = strings.TrimPrefix(tag, "uniqueIndex:")
-				} else if strings.HasPrefix(tag, "unique_index:") {
-					// GORM v1 format
-					indexName = strings.TrimPrefix(tag, "unique_index:")
-				} else if tag == "unique" || tag == "uniqueIndex" || tag == "unique_index" {
-					// Single field unique constraint (both v1 and v2 formats)
-					indexName = field.Name
-				}
-			}
-
-			if indexName != "" {
-				indexMap[indexName] = append(indexMap[indexName], field)
-			}
-		}
-	}
-
-	// Convert map to slice
-	var uniqueIndexes [][]reflect.StructField
-	for _, fields := range indexMap {
-		uniqueIndexes = append(uniqueIndexes, fields)
-	}
-
-	return uniqueIndexes
 }
 
 // Insert submits one or more items for batch insertion
@@ -456,7 +330,7 @@ func executeIndividualUpdates[T any](
 	// Determine fields to update
 	fieldsToUpdate := updateItem.UpdateFields
 	if len(fieldsToUpdate) == 0 {
-		fieldsToUpdate = nonPrimaryKeyFieldNames(itemType)
+		fieldsToUpdate = mapping.allUpdatable()
 	}
 
 	// Add UpdatedAt if it exists and isn't already included
@@ -525,7 +399,7 @@ func executeUpdatesBatchAsSeparateStatements[T any](
 
 		fieldsToUpdate := updateItem.UpdateFields
 		if len(fieldsToUpdate) == 0 {
-			fieldsToUpdate = nonPrimaryKeyFieldNames(itemType)
+			fieldsToUpdate = mapping.allUpdatable()
 		}
 
 		_, updatedAtExists := itemType.FieldByName("UpdatedAt")
@@ -579,12 +453,8 @@ func executeUpdatesBatchAsSeparateStatements[T any](
 // useMultipleStatements a flag to enable multiple statements in a single query.  Experimental and has not been tested.
 var useMultipleStatements = false // Set to true if sql_mode has ALLOW_MULTIPLE_STATEMENTS
 
-func batchUpdate[T any](
-	dbProvider DBProvider,
-	tableName string,
-	primaryKeyFields []reflect.StructField,
-	primaryKeyNames []string,
-	timeout int) func([][]UpdateItem[T]) []error {
+func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[T]) []error {
+	var models modelCache
 	return func(batches [][]UpdateItem[T]) []error {
 		if len(batches) == 0 {
 			return nil
@@ -599,10 +469,23 @@ func batchUpdate[T any](
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
-		mapping, err := createFieldMapping(allUpdateItems[0].Item)
+		// Table, column and key names come from GORM's schema for the model,
+		// with the naming strategy of the database the batch is written to.
+		namingDB, err := dbProvider()
+		if err != nil {
+			return batcher.RepeatErr(len(batches), fmt.Errorf("failed to get database connection: %w", err))
+		}
+		info, err := models.get(namingDB, reflect.TypeOf(allUpdateItems[0].Item))
 		if err != nil {
 			return batcher.RepeatErr(len(batches), err)
 		}
+		tableName := info.schema.Table
+		primaryKeyFields := info.primaryKeyStructFields()
+		primaryKeyNames := make([]string, len(info.primaryKeys))
+		for i, f := range info.primaryKeys {
+			primaryKeyNames[i] = f.DBName
+		}
+		mapping := createFieldMapping(info.schema)
 
 		// Replace original slice with deduplicated one
 		allUpdateItems, err = dedupeUpdateItems(allUpdateItems, primaryKeyFields, mapping)
@@ -625,7 +508,7 @@ func batchUpdate[T any](
 
 			fieldsToUpdate := updateItem.UpdateFields
 			if len(fieldsToUpdate) == 0 {
-				fieldsToUpdate = nonPrimaryKeyFieldNames(itemType)
+				fieldsToUpdate = mapping.allUpdatable()
 			}
 
 			_, updatedAtExists := itemType.FieldByName("UpdatedAt")
@@ -769,19 +652,6 @@ func batchUpdate[T any](
 	}
 }
 
-// nonPrimaryKeyFieldNames lists the struct fields an update with no explicit
-// field list writes: every field except the primary key.
-func nonPrimaryKeyFieldNames(itemType reflect.Type) []string {
-	var names []string
-	for i := 0; i < itemType.NumField(); i++ {
-		field := itemType.Field(i)
-		if !isPrimaryKey(field) {
-			names = append(names, field.Name)
-		}
-	}
-	return names
-}
-
 // dedupeUpdateItems merges the updates of one row into a single update. The
 // batched UPDATE takes the first CASE branch that matches a row, so without the
 // merge every later update of that row would be dropped.
@@ -813,7 +683,7 @@ func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields [
 	// namedFields returns the fields an update writes.
 	namedFields := func(u UpdateItem[T], itemValue reflect.Value) ([]namedField, error) {
 		if len(u.UpdateFields) == 0 {
-			all := nonPrimaryKeyFieldNames(itemValue.Type())
+			all := mapping.allUpdatable()
 			named := make([]namedField, len(all))
 			for i, name := range all {
 				named[i] = namedField{structName: name, spelling: name}
@@ -961,15 +831,12 @@ func deduplicateRecords[T any](records []T, primaryKeyFields []reflect.StructFie
 }
 
 func deduplicateChildRecords(instances []interface{}, modelType reflect.Type) []interface{} {
-	// Get primary key info for this child type
-	primaryKeyFields, _, err := getPrimaryKeyInfo(modelType)
-	if err != nil || len(primaryKeyFields) == 0 {
+	info, err := parseModel(nil, modelType)
+	if err != nil || len(info.primaryKeys) == 0 {
 		// No primary key, cannot deduplicate
 		return instances
 	}
-
-	// Use the generic deduplication function
-	return deduplicateRecords(instances, primaryKeyFields)
+	return deduplicateRecords(instances, info.primaryKeyStructFields())
 }
 
 func dedupeInsertItems[T any](allRecords []T, primaryKeyFields []reflect.StructField) []T {
@@ -991,79 +858,6 @@ func contains(slice []string, str string) bool {
 		}
 	}
 	return false
-}
-
-type fieldMapping struct {
-	structToDb map[string]string
-	dbToStruct map[string]string
-}
-
-func createFieldMapping(item interface{}) (fieldMapping, error) {
-	mapping := fieldMapping{
-		structToDb: make(map[string]string),
-		dbToStruct: make(map[string]string),
-	}
-	t := reflect.TypeOf(item)
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		dbFieldName := getDBFieldName(field)
-		mapping.structToDb[field.Name] = dbFieldName
-		mapping.dbToStruct[dbFieldName] = field.Name
-	}
-
-	return mapping, nil
-}
-
-func getFieldNames(fieldName string, mapping fieldMapping) (string, string, error) {
-	if structFieldName, ok := mapping.dbToStruct[fieldName]; ok {
-		return structFieldName, fieldName, nil
-	}
-	if dbFieldName, ok := mapping.structToDb[fieldName]; ok {
-		return fieldName, dbFieldName, nil
-	}
-	return "", "", fmt.Errorf("field %s not found", fieldName)
-}
-
-func getDBFieldName(field reflect.StructField) string {
-	if dbName := field.Tag.Get("gorm"); dbName != "" {
-		if strings.Contains(dbName, "column") {
-			return strings.Split(strings.Split(dbName, "column:")[1], ";")[0]
-		}
-	}
-	return toSnakeCase(field.Name)
-}
-
-func getPrimaryKeyValues[T any](items []UpdateItem[T], primaryKeyFieldName string) []interface{} {
-	var values []interface{}
-	for _, item := range items {
-		itemValue := reflect.ValueOf(item.Item)
-		if itemValue.Kind() == reflect.Ptr {
-			itemValue = itemValue.Elem()
-		}
-		values = append(values, itemValue.FieldByName(primaryKeyFieldName).Interface())
-	}
-	return values
-}
-
-func toSnakeCase(s string) string {
-	var result strings.Builder
-	for i, r := range s {
-		if i > 0 {
-			prevIsLower := unicode.IsLower(rune(s[i-1]))
-			currIsUpper := unicode.IsUpper(r)
-			nextIsLower := i+1 < len(s) && unicode.IsLower(rune(s[i+1]))
-
-			if (prevIsLower && currIsUpper) || (currIsUpper && nextIsLower) {
-				result.WriteRune('_')
-			}
-		}
-		result.WriteRune(unicode.ToLower(r))
-	}
-	return result.String()
 }
 
 type SelectBatcher[T any] struct {
@@ -1098,35 +892,23 @@ func NewSelectBatcherWithOptions[T any](dbProvider DBProvider, ctx context.Conte
 		opt(&config)
 	}
 
-	tableName := getTableName[T]()
-
-	// Validate columns against model
+	// Every column must be a column of the model as GORM maps it, named by
+	// its column name.
 	var model T
-	t := reflect.TypeOf(model)
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-
-	allColumns, err := getColumnNames(model)
+	info, err := parseModel(nil, reflect.TypeOf(model))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get column names: %w", err)
+		return nil, err
 	}
-
-	columnSet := make(map[string]bool)
-	for _, col := range allColumns {
-		columnSet[col] = true
-	}
-
 	for _, col := range columns {
-		if !columnSet[col] {
+		if f := info.schema.LookUpField(col); f == nil || f.DBName != col {
 			return nil, fmt.Errorf("column %s does not exist in model", col)
 		}
 	}
 
 	return &SelectBatcher[T]{
 		dbProvider: dbProvider,
-		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchSelect[T](dbProvider, tableName, columns, config.Timeout), opts...),
-		tableName:  tableName,
+		batcher:    batcher.NewBatchProcessorWithOptions(ctx, batchSelect[T](dbProvider, columns, config.Timeout), opts...),
+		tableName:  info.schema.Table,
 		columns:    columns,
 	}, nil
 }
@@ -1158,50 +940,69 @@ func (b *SelectBatcher[T]) SelectAsync(callback func([]T, error), condition stri
 	})
 }
 
-func processRows[T any](rows *sql.Rows, columns []string, allItems []SelectItem[T]) error {
-	// Prepare a slice of slices to hold all results
+// processRows assigns each row to the select it answers, by the __index
+// column, and sets the selected columns with GORM's own field setters, which
+// convert driver values the way GORM's queries do: integers to booleans, bytes
+// to numbers, strings and times, and NULL to the zero value.
+func processRows[T any](rows *sql.Rows, fields []*schema.Field, allItems []SelectItem[T]) error {
 	results := make([][]T, len(allItems))
 	for i := range results {
 		results[i] = make([]T, 0)
 	}
 
-	// Scan the results
+	ctx := context.Background()
 	for rows.Next() {
-		values := make([]interface{}, len(columns)+1) // +1 for __index
+		values := make([]interface{}, len(fields)+1) // +1 for __index
 		for i := range values {
 			values[i] = new(interface{})
 		}
-
 		if err := rows.Scan(values...); err != nil {
 			return fmt.Errorf("failed to scan row: %w", err)
 		}
 
-		// Get the index
-		indexValue := reflect.ValueOf(values[0]).Elem().Interface()
-		index, err := convertToInt(indexValue)
+		index, err := convertToInt(*values[0].(*interface{}))
 		if err != nil {
 			return fmt.Errorf("failed to parse index: %w", err)
 		}
-
-		// Create a new instance of T and scan into it
-		var result T
-		if err := scanIntoStruct(&result, columns, values[1:]); err != nil {
-			return fmt.Errorf("failed to scan into struct: %w", err)
+		if index < 0 || index >= len(results) {
+			return fmt.Errorf("row index %d out of range for %d selects", index, len(results))
 		}
 
-		// Append the result to the corresponding slice
+		var result T
+		rv := reflect.ValueOf(&result).Elem()
+		if rv.Kind() == reflect.Pointer {
+			rv.Set(reflect.New(rv.Type().Elem()))
+			rv = rv.Elem()
+		}
+		for i, f := range fields {
+			if err := f.Set(ctx, rv, *values[i+1].(*interface{})); err != nil {
+				return fmt.Errorf("failed to set column %s: %w", f.DBName, err)
+			}
+		}
 		results[index] = append(results[index], result)
 	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read rows: %w", err)
+	}
 
-	// Assign results back to the original items
 	for i, item := range allItems {
 		*item.Results = results[i]
 	}
-
 	return nil
 }
 
-func batchSelect[T any](dbProvider DBProvider, tableName string, columns []string, timeout int) func([][]SelectItem[T]) []error {
+// selectIndexExpression is the placeholder that numbers each select of a
+// batch, cast to an integer type the dialect supports. An unsized CHAR is one
+// character on Postgres, which truncated indexes of 10 and above.
+func selectIndexExpression(dialect string) string {
+	if dialect == "mysql" {
+		return "CAST(? AS SIGNED)"
+	}
+	return "CAST(? AS INTEGER)"
+}
+
+func batchSelect[T any](dbProvider DBProvider, columns []string, timeout int) func([][]SelectItem[T]) []error {
+	var models modelCache
 	return func(batches [][]SelectItem[T]) (errs []error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1227,20 +1028,33 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			return batcher.RepeatErr(len(batches), nil)
 		}
 
+		var model T
+		info, err := models.get(db, reflect.TypeOf(model))
+		if err != nil {
+			return batcher.RepeatErr(len(batches), err)
+		}
+		fields := make([]*schema.Field, len(columns))
+		for i, col := range columns {
+			if fields[i] = info.schema.LookUpField(col); fields[i] == nil {
+				return batcher.RepeatErr(len(batches), fmt.Errorf("column %s does not exist in model", col))
+			}
+		}
+
 		// Build the query
 		var queryBuilder strings.Builder
 		var args []interface{}
 
 		dialectName := db.Dialector.Name()
+		indexColumn := selectIndexExpression(dialectName) + " AS " + quoteIdentifier("__index", dialectName)
 
 		for i, item := range allItems {
 			if i > 0 {
 				queryBuilder.WriteString(" UNION ALL ")
 			}
-			selectColumns := append([]string{fmt.Sprintf("CAST(? AS CHAR) AS %s", quoteIdentifier("__index", dialectName))}, columns...)
+			selectColumns := append([]string{indexColumn}, columns...)
 			queryBuilder.WriteString(fmt.Sprintf("SELECT %s FROM %s WHERE %s",
 				strings.Join(selectColumns, ", "),
-				quoteIdentifier(tableName, dialectName),
+				quoteIdentifier(info.schema.Table, dialectName),
 				item.Condition))
 			args = append(args, i) // Add index as an argument
 			args = append(args, item.Args...)
@@ -1257,7 +1071,7 @@ func batchSelect[T any](dbProvider DBProvider, tableName string, columns []strin
 			defer rows.Close()
 
 			// Process the rows within the transaction
-			processingErr = processRows(rows, columns, allItems)
+			processingErr = processRows(rows, fields, allItems)
 			return nil
 		})
 
@@ -1303,129 +1117,6 @@ func quoteIdentifier(identifier string, dialect string) string {
 	default:
 		return identifier
 	}
-}
-
-func getColumnNames(model interface{}) ([]string, error) {
-	t := reflect.TypeOf(model)
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	if t.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("model must be a struct or a pointer to a struct")
-	}
-
-	var columns []string
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if field.Anonymous {
-			continue // Skip embedded fields
-		}
-		gormTag := field.Tag.Get("gorm")
-		column := ""
-		if gormTag != "" && gormTag != "-" {
-			tagParts := strings.Split(gormTag, ";")
-			for _, part := range tagParts {
-				if strings.HasPrefix(part, "column:") {
-					column = strings.TrimPrefix(part, "column:")
-					break
-				}
-			}
-		}
-		if column == "" {
-			column = toSnakeCase(field.Name)
-		}
-		columns = append(columns, column)
-	}
-	return columns, nil
-}
-
-func scanIntoStruct(result interface{}, columns []string, values []interface{}) error {
-	resultValue := reflect.ValueOf(result)
-	if resultValue.Kind() != reflect.Ptr {
-		return fmt.Errorf("result must be a pointer")
-	}
-	resultValue = resultValue.Elem()
-
-	if resultValue.Kind() == reflect.Ptr {
-		if resultValue.IsNil() {
-			resultValue.Set(reflect.New(resultValue.Type().Elem()))
-		}
-		resultValue = resultValue.Elem()
-	}
-
-	if resultValue.Kind() != reflect.Struct {
-		return fmt.Errorf("result must be a pointer to a struct")
-	}
-
-	resultType := resultValue.Type()
-
-	for i, column := range columns {
-		value := reflect.ValueOf(values[i]).Elem().Interface()
-
-		field := resultValue.FieldByNameFunc(func(name string) bool {
-			field, _ := resultType.FieldByName(name)
-			dbName := field.Tag.Get("gorm")
-			if dbName == column {
-				return true
-			}
-			return strings.EqualFold(name, column) ||
-				strings.EqualFold(toSnakeCase(name), column) ||
-				strings.EqualFold(name, strings.ReplaceAll(column, "_", ""))
-		})
-
-		if !field.IsValid() {
-			return fmt.Errorf("no field found for column %s", column)
-		}
-
-		if !field.CanSet() {
-			return fmt.Errorf("field %s cannot be set (might be unexported)", column)
-		}
-
-		switch field.Kind() {
-		case reflect.String:
-			switch v := value.(type) {
-			case []uint8:
-				field.SetString(string(v))
-			case string:
-				field.SetString(v)
-			default:
-				return fmt.Errorf("cannot set string field %s with value of type %T", column, value)
-			}
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			switch v := value.(type) {
-			case int64:
-				field.SetUint(uint64(v))
-			case uint64:
-				field.SetUint(v)
-			default:
-				return fmt.Errorf("cannot set uint field %s with value of type %T", column, value)
-			}
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			switch v := value.(type) {
-			case int64:
-				field.SetInt(v)
-			case int:
-				field.SetInt(int64(v))
-			default:
-				return fmt.Errorf("cannot set int field %s with value of type %T", column, value)
-			}
-		case reflect.Float32, reflect.Float64:
-			v, ok := value.(float64)
-			if !ok {
-				return fmt.Errorf("cannot set float field %s with value of type %T", column, value)
-			}
-			field.SetFloat(v)
-		case reflect.Bool:
-			v, ok := value.(bool)
-			if !ok {
-				return fmt.Errorf("cannot set bool field %s with value of type %T", column, value)
-			}
-			field.SetBool(v)
-		default:
-			return fmt.Errorf("unsupported field type for %s: %v", column, field.Kind())
-		}
-	}
-	return nil
 }
 
 func retryWithDeadlockDetection(maxRetries int, timeout int, dbProvider DBProvider, operation func(*gorm.DB) error) error {
@@ -1543,38 +1234,29 @@ func buildOnConflictClauseForType(tx *gorm.DB, modelType reflect.Type) clause.On
 	// PostgreSQL/SQLite: ON CONFLICT requires targeting a SINGLE unique constraint
 	// Strategy: Try unique indexes first (for auto-increment PKs), fall back to PK
 
-	uniqueIndexes := getUniqueIndexes(modelType)
-	primaryKeyFields, _, _ := getPrimaryKeyInfo(modelType)
+	info, err := parseModel(tx, modelType)
+	if err != nil {
+		return clause.OnConflict{UpdateAll: true} // let GORM handle it
+	}
 
-	// If we have unique indexes, use the first one as conflict target
+	// If we have unique indexes, use the first one as conflict target. They
+	// are sorted by name, so the target is the same on every batch.
 	// This handles the common case where ID=0 (auto-increment) conflicts on unique index
-	if len(uniqueIndexes) > 0 {
-		var conflictColumns []clause.Column
-		for _, field := range uniqueIndexes[0] {
-			columnName := getDBFieldName(field)
-			conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
-		}
-		return clause.OnConflict{
-			Columns:   conflictColumns,
-			UpdateAll: true,
-		}
+	target := info.primaryKeys
+	if len(info.uniqueIndexes) > 0 {
+		target = info.uniqueIndexes[0]
 	}
-
-	// No unique indexes, use primary key
-	if len(primaryKeyFields) > 0 {
-		var conflictColumns []clause.Column
-		for _, pkField := range primaryKeyFields {
-			columnName := getDBFieldName(pkField)
-			conflictColumns = append(conflictColumns, clause.Column{Name: columnName})
-		}
-		return clause.OnConflict{
-			Columns:   conflictColumns,
-			UpdateAll: true,
-		}
+	if len(target) == 0 {
+		return clause.OnConflict{UpdateAll: true} // let GORM handle it
 	}
-
-	// Fallback: let GORM handle it
-	return clause.OnConflict{UpdateAll: true}
+	conflictColumns := make([]clause.Column, len(target))
+	for i, f := range target {
+		conflictColumns[i] = clause.Column{Name: f.DBName}
+	}
+	return clause.OnConflict{
+		Columns:   conflictColumns,
+		UpdateAll: true,
+	}
 }
 
 // buildOnConflictClause builds the appropriate OnConflict clause based on database dialect
@@ -1593,6 +1275,12 @@ func (ib *InsertBatcher[T]) reloadRecordsByUniqueIndexes(allRecords []T, recordI
 	if err != nil {
 		return fmt.Errorf("failed to get database connection: %w", err)
 	}
+	// Column names with the naming strategy of the database being read.
+	var model T
+	info, err := ib.models.get(db, reflect.TypeOf(model))
+	if err != nil {
+		return err
+	}
 
 	// For each record that needs reloading, query by unique indexes
 	for _, idx := range recordIndices {
@@ -1606,7 +1294,7 @@ func (ib *InsertBatcher[T]) reloadRecordsByUniqueIndexes(allRecords []T, recordI
 		var reloadedRecord T
 		found := false
 
-		for _, uniqueIndex := range ib.uniqueIndexes {
+		for _, uniqueIndex := range info.uniqueIndexes {
 			// Build WHERE clause for this unique index
 			// Use Model() instead of Table() to get correct table name from GORM's schema
 			query := db.Model(new(T))
@@ -1620,8 +1308,8 @@ func (ib *InsertBatcher[T]) reloadRecordsByUniqueIndexes(allRecords []T, recordI
 					break
 				}
 
-				columnName := getDBFieldName(field)
-				query = query.Where(fmt.Sprintf("%s = ?", columnName), fieldValue.Interface())
+				// clause.Eq quotes the column, which may be a reserved word.
+				query = query.Where(clause.Eq{Column: clause.Column{Name: field.DBName}, Value: fieldValue.Interface()})
 			}
 
 			if !allFieldsSet {

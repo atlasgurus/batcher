@@ -24,8 +24,9 @@ type orderedRecord struct {
 // different orders. Rows now keep the position where their key first
 // appeared, with the last value; rows without a key keep their own position.
 func TestDeduplicateRecordsKeepsFirstSeenOrder(t *testing.T) {
-	pk, _, err := getPrimaryKeyInfo(reflect.TypeOf(orderedRecord{}))
+	info, err := parseModel(nil, reflect.TypeOf(orderedRecord{}))
 	require.NoError(t, err)
+	pk := info.primaryKeyStructFields()
 	in := []orderedRecord{
 		{ID: 5, Name: "five"},
 		{ID: 3, Name: "three, first"},
