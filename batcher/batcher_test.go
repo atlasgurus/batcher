@@ -437,3 +437,180 @@ func TestBatchProcessor(t *testing.T) {
 		mu.Unlock()
 	})
 }
+
+func TestSubmitDoesNotWaitForBatchInFlight(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	processor := NewBatchProcessor(
+		2,
+		time.Millisecond,
+		ctx,
+		func(items []int) []error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			return make([]error, len(items))
+		},
+	)
+
+	// The first submit starts a batch that blocks until release is closed.
+	processor.Submit(0, func(error) {})
+	<-started
+
+	// While that batch is in flight, a full batch's worth of submits must
+	// return without waiting for processFn.
+	done := make(chan struct{})
+	go func() {
+		processor.Submit(1, func(error) {})
+		processor.Submit(2, func(error) {})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Submit waited for the batch in flight")
+	}
+	close(release)
+}
+
+func TestShutdownProcessesBufferedItems(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	var mu sync.Mutex
+	var processed []int
+	processor := NewBatchProcessor(
+		5,
+		time.Hour,
+		ctx,
+		func(items []int) []error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			mu.Lock()
+			processed = append(processed, items...)
+			mu.Unlock()
+			return make([]error, len(items))
+		},
+	)
+
+	var callbacks sync.WaitGroup
+	submit := func(i int) {
+		callbacks.Add(1)
+		processor.Submit(i, func(err error) {
+			assert.NoError(t, err)
+			callbacks.Done()
+		})
+	}
+
+	// Fill one batch so processFn starts and blocks.
+	for i := 0; i < 5; i++ {
+		submit(i)
+	}
+	<-started
+	// These sit in the buffer behind the blocked batch.
+	for i := 5; i < 8; i++ {
+		submit(i)
+	}
+
+	cancel()
+	close(release)
+	processor.WaitForShutdown()
+	callbacks.Wait()
+
+	assert.ElementsMatch(t, []int{0, 1, 2, 3, 4, 5, 6, 7}, processed)
+}
+
+func TestSubmitAfterShutdownProcessesDirectly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var mu sync.Mutex
+	var processed []int
+	processor := NewBatchProcessor(
+		5,
+		time.Hour,
+		ctx,
+		func(items []int) []error {
+			mu.Lock()
+			processed = append(processed, items...)
+			mu.Unlock()
+			return make([]error, len(items))
+		},
+	)
+	cancel()
+	processor.WaitForShutdown()
+
+	require.NoError(t, processor.SubmitAndWait(1))
+	errCh := make(chan error, 1)
+	processor.Submit(2, func(err error) { errCh <- err })
+	require.NoError(t, <-errCh)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.ElementsMatch(t, []int{1, 2}, processed)
+}
+
+// TestShutdownLosesNothingUnderConcurrentSubmits races submitters against
+// shutdown. Every item must be processed exactly once and every caller must
+// get an answer, whether its item went through the batch, the final drain, or
+// the direct path.
+func TestShutdownLosesNothingUnderConcurrentSubmits(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		var mu sync.Mutex
+		seen := make(map[int]int)
+		processor := NewBatchProcessor(
+			4,
+			time.Millisecond,
+			ctx,
+			func(items []int) []error {
+				mu.Lock()
+				for _, it := range items {
+					seen[it]++
+				}
+				mu.Unlock()
+				return make([]error, len(items))
+			},
+		)
+
+		const submitters, perSubmitter = 8, 25
+		var wg sync.WaitGroup
+		for s := 0; s < submitters; s++ {
+			wg.Add(1)
+			go func(s int) {
+				defer wg.Done()
+				for i := 0; i < perSubmitter; i++ {
+					item := s*perSubmitter + i
+					if i%2 == 0 {
+						assert.NoError(t, processor.SubmitAndWait(item))
+						continue
+					}
+					errCh := make(chan error, 1)
+					processor.Submit(item, func(err error) { errCh <- err })
+					select {
+					case err := <-errCh:
+						assert.NoError(t, err)
+					case <-time.After(5 * time.Second):
+						t.Errorf("item %d: callback never ran", item)
+					}
+				}
+			}(s)
+		}
+		time.Sleep(time.Duration(round%5) * time.Millisecond)
+		cancel()
+		wg.Wait()
+		processor.WaitForShutdown()
+
+		mu.Lock()
+		require.Len(t, seen, submitters*perSubmitter, "round %d", round)
+		for item, n := range seen {
+			require.Equal(t, 1, n, "round %d item %d processed %d times", round, item, n)
+		}
+		mu.Unlock()
+	}
+}

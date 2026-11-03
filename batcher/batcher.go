@@ -2,6 +2,7 @@ package batcher
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -35,9 +36,20 @@ type BatchProcessorInterface[T any] interface {
 	WaitForShutdown()
 }
 
-// BatchProcessor is a generic batch processor
+// BatchProcessor is a generic batch processor.
+//
+// The input channel holds up to one full batch, so a caller that submits while
+// a batch is being processed returns at once instead of waiting for processFn.
+// A caller waits only when a whole batch is already queued behind the one in
+// flight, which is the backpressure point.
+//
+// On shutdown the run loop sets closed under mu and then processes whatever is
+// still buffered. Every send happens under the read lock after checking closed,
+// so no item can land in the buffer after that final drain.
 type BatchProcessor[T any] struct {
 	input     chan batchItem[T]
+	mu        sync.RWMutex
+	closed    bool
 	config    BatchProcessorConfig
 	processFn func([]T) []error
 	ctx       context.Context
@@ -116,7 +128,7 @@ func NewBatchProcessorWithOptions[T any](
 	}
 
 	bp := &BatchProcessor[T]{
-		input:     make(chan batchItem[T]),
+		input:     make(chan batchItem[T], max(config.MaxBatchSize, 0)),
 		config:    config,
 		processFn: processFn,
 		ctx:       ctx,
@@ -129,31 +141,46 @@ func NewBatchProcessorWithOptions[T any](
 	return bp
 }
 
-// SubmitAndWait submits an item for processing and waits for the result
-func (bp *BatchProcessor[T]) SubmitAndWait(item T) error {
-	respChan := make(chan error, 1)
+// enqueue hands an item to the run loop. It reports false when the processor
+// is shutting down, and the caller then processes the item itself.
+func (bp *BatchProcessor[T]) enqueue(it batchItem[T]) bool {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	if bp.closed {
+		return false
+	}
 	select {
-	case bp.input <- batchItem[T]{item: item, resp: respChan}:
-		return <-respChan
+	case bp.input <- it:
+		return true
 	case <-bp.ctx.Done():
-		// Process the item directly when the context is canceled
-		return bp.processFn([]T{item})[0]
+		return false
 	}
 }
 
-// Submit submits an item for processing and calls the callback function when done
+// SubmitAndWait submits an item for processing and waits for the result
+func (bp *BatchProcessor[T]) SubmitAndWait(item T) error {
+	respChan := make(chan error, 1)
+	if bp.enqueue(batchItem[T]{item: item, resp: respChan}) {
+		return <-respChan
+	}
+	// Process the item directly when the context is canceled
+	return bp.processFn([]T{item})[0]
+}
+
+// Submit submits an item for processing and calls the callback function when
+// done. It returns once the item is queued, without waiting for the batch that
+// is currently being processed.
 func (bp *BatchProcessor[T]) Submit(item T, callback func(error)) {
 	respChan := make(chan error, 1)
-	select {
-	case bp.input <- batchItem[T]{item: item, resp: respChan}:
+	if bp.enqueue(batchItem[T]{item: item, resp: respChan}) {
 		go func() {
 			callback(<-respChan)
 		}()
-	case <-bp.ctx.Done():
-		go func() {
-			callback(bp.processFn([]T{item})[0])
-		}()
+		return
 	}
+	go func() {
+		callback(bp.processFn([]T{item})[0])
+	}()
 }
 
 // WaitForShutdown blocks until the batch processor has finished processing all remaining items and shut down
@@ -204,23 +231,45 @@ func (bp *BatchProcessor[T]) run() {
 		}
 	}
 
+	add := func(item batchItem[T]) {
+		batch = append(batch, item.item)
+		respChans = append(respChans, item.resp)
+		if len(batch) == 1 && !timerActive {
+			timer.Reset(bp.config.MaxWaitTime)
+			timerActive = true
+		}
+		if len(batch) >= bp.config.MaxBatchSize {
+			processBatch()
+		}
+	}
+
 	for {
 		select {
 		case item := <-bp.input:
-			batch = append(batch, item.item)
-			respChans = append(respChans, item.resp)
-			if len(batch) == 1 && !timerActive {
-				timer.Reset(bp.config.MaxWaitTime)
-				timerActive = true
-			}
-			if len(batch) >= bp.config.MaxBatchSize {
-				processBatch()
-			}
+			add(item)
 		case <-timer.C:
 			processBatch()
 			timerActive = false
 		case <-bp.ctx.Done():
+			bp.drain(add)
 			processBatch() // Process any remaining items
+			return
+		}
+	}
+}
+
+// drain stops new sends and passes every item still buffered to add. Taking
+// the write lock waits for senders already inside enqueue; each of them
+// returns promptly because the context is done.
+func (bp *BatchProcessor[T]) drain(add func(batchItem[T])) {
+	bp.mu.Lock()
+	bp.closed = true
+	bp.mu.Unlock()
+	for {
+		select {
+		case item := <-bp.input:
+			add(item)
+		default:
 			return
 		}
 	}
