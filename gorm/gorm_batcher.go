@@ -487,10 +487,40 @@ func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[
 		}
 		mapping := createFieldMapping(info.schema)
 
-		// Replace original slice with deduplicated one
-		allUpdateItems, err = dedupeUpdateItems(allUpdateItems, primaryKeyFields, mapping)
+		// Each caller gets the errors of its own rows only. errs holds one
+		// entry per caller; a caller whose field names do not resolve fails
+		// alone and its rows are left out, and failValid gives an error that
+		// concerns the whole batch to every caller still in it.
+		errs := make([]error, len(batches))
+		failValid := func(err error) []error {
+			for b := range errs {
+				if errs[b] == nil {
+					errs[b] = err
+				}
+			}
+			return errs
+		}
+		var validItems []UpdateItem[T]
+		var validOrigins []int
+		for b, batch := range batches {
+			if err := checkUpdateFields(batch, mapping); err != nil {
+				errs[b] = err
+				continue
+			}
+			for _, u := range batch {
+				validItems = append(validItems, u)
+				validOrigins = append(validOrigins, b)
+			}
+		}
+		if len(validItems) == 0 {
+			return errs
+		}
+
+		// Replace original slice with deduplicated one; rowOrigins[i] lists
+		// the callers whose updates make up allUpdateItems[i].
+		allUpdateItems, rowOrigins, err := dedupeUpdateItems(validItems, validOrigins, primaryKeyFields, mapping)
 		if err != nil {
-			return batcher.RepeatErr(len(batches), err)
+			return failValid(err)
 		}
 
 		updateFieldsMap := make(map[string]bool)
@@ -519,7 +549,7 @@ func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[
 			for _, fieldName := range fieldsToUpdate {
 				structFieldName, dbFieldName, getFieldErr := getFieldNames(fieldName, mapping)
 				if getFieldErr != nil {
-					return batcher.RepeatErr(len(batches), getFieldErr)
+					return failValid(getFieldErr)
 				}
 
 				if !updateFieldsMap[dbFieldName] {
@@ -553,7 +583,7 @@ func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[
 		}
 
 		if len(updateFields) == 0 {
-			return batcher.RepeatErr(len(batches), fmt.Errorf("no fields to update"))
+			return failValid(fmt.Errorf("no fields to update"))
 		}
 
 		var queryBuilder strings.Builder
@@ -590,7 +620,7 @@ func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[
 			for _, pkField := range primaryKeyFields {
 				field := itemValue.FieldByName(pkField.Name)
 				if !field.IsValid() {
-					return batcher.RepeatErr(len(batches), fmt.Errorf("primary key field %s not found in struct", pkField.Name))
+					return failValid(fmt.Errorf("primary key field %s not found in struct", pkField.Name))
 				}
 				allValues = append(allValues, field.Interface())
 			}
@@ -610,7 +640,7 @@ func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[
 
 			// If batch update succeeds, return success
 			if batchErr == nil {
-				return batcher.RepeatErr(len(batches), nil)
+				return errs
 			}
 
 		} else {
@@ -621,13 +651,14 @@ func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[
 
 			// If batch update succeeds, return success
 			if batchErr == nil {
-				return batcher.RepeatErr(len(batches), nil)
+				return errs
 			}
 		}
 
-		// If batch update fails, try individual updates
-		var fallbackErrors []error
-		for _, updateItem := range allUpdateItems {
+		// If batch update fails, try individual updates. A row that still
+		// fails fails only the callers whose updates it carries; the others'
+		// rows were written.
+		for i, updateItem := range allUpdateItems {
 			if retryErr := retryWithDeadlockDetection(maxRetries, timeout, dbProvider, func(tx *gorm.DB) error {
 				return executeIndividualUpdates(
 					tx,
@@ -638,18 +669,29 @@ func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[
 					mapping,
 				)
 			}); retryErr != nil {
-				fallbackErrors = append(fallbackErrors, fmt.Errorf("failed individual update: %w", retryErr))
+				rowErr := fmt.Errorf("batch update failed: %v, individual update failed: %w", batchErr, retryErr)
+				for _, b := range rowOrigins[i] {
+					if errs[b] == nil {
+						errs[b] = rowErr
+					}
+				}
 			}
 		}
-		if len(fallbackErrors) > 0 {
-			// Both batch and individual updates failed
-			fallbackErr := fmt.Errorf("%d individual updates failed: (%v)", len(fallbackErrors), fallbackErrors)
-			return batcher.RepeatErr(len(batches), fmt.Errorf("batch update failed: %v, individual updates failed: %v", batchErr, fallbackErr))
-		}
-
-		// Individual updates succeeded
-		return batcher.RepeatErr(len(batches), nil)
+		return errs
 	}
+}
+
+// checkUpdateFields reports whether every field name one caller's updates
+// name exists in the model.
+func checkUpdateFields[T any](updates []UpdateItem[T], mapping fieldMapping) error {
+	for _, u := range updates {
+		for _, f := range u.UpdateFields {
+			if _, _, err := getFieldNames(f, mapping); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // dedupeUpdateItems merges the updates of one row into a single update. The
@@ -668,7 +710,10 @@ func batchUpdate[T any](dbProvider DBProvider, timeout int) func([][]UpdateItem[
 // A row updated once keeps its original UpdateItem. A merged row gets a new
 // item; the callers' items are never modified. Rows keep the order in which
 // they were first seen.
-func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields []reflect.StructField, mapping fieldMapping) ([]UpdateItem[T], error) {
+//
+// origins[i] names the caller that submitted allUpdateItems[i]; the second
+// result lists, for each returned update, the callers whose updates it carries.
+func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], origins []int, primaryKeyFields []reflect.StructField, mapping fieldMapping) ([]UpdateItem[T], [][]int, error) {
 	type namedField struct {
 		structName string // the field the value is copied from and to
 		spelling   string // the name as the caller gave it
@@ -678,6 +723,7 @@ func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields [
 		value    reflect.Value     // addressable copy of the row, once a second update arrives
 		fields   []string          // struct field names named so far, in first-named order
 		spelling map[string]string // struct field name -> spelling of the last update that named it
+		origins  []int             // callers whose updates the row carries, each once
 	}
 
 	// namedFields returns the fields an update writes.
@@ -704,7 +750,8 @@ func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields [
 	rows := make(map[string]*mergedRow)
 	var result []*mergedRow
 	var unkeyed []UpdateItem[T]
-	for _, u := range allUpdateItems {
+	var unkeyedOrigins [][]int
+	for i, u := range allUpdateItems {
 		itemValue := reflect.ValueOf(u.Item)
 		if itemValue.Kind() == reflect.Pointer {
 			itemValue = itemValue.Elem()
@@ -713,11 +760,12 @@ func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields [
 		if !ok {
 			// A zero primary key names no particular row; nothing to merge.
 			unkeyed = append(unkeyed, u)
+			unkeyedOrigins = append(unkeyedOrigins, []int{origins[i]})
 			continue
 		}
 		fields, err := namedFields(u, itemValue)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		row, seen := rows[key]
@@ -738,7 +786,7 @@ func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields [
 			for _, f := range fields {
 				dst := row.value.FieldByName(f.structName)
 				if !dst.CanSet() {
-					return nil, fmt.Errorf("field %s cannot be set when merging updates of one row", f.structName)
+					return nil, nil, fmt.Errorf("field %s cannot be set when merging updates of one row", f.structName)
 				}
 				dst.Set(itemValue.FieldByName(f.structName))
 			}
@@ -749,10 +797,15 @@ func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields [
 			}
 			row.spelling[f.structName] = f.spelling
 		}
+		if !containsInt(row.origins, origins[i]) {
+			row.origins = append(row.origins, origins[i])
+		}
 	}
 
 	deduplicated := make([]UpdateItem[T], 0, len(result)+len(unkeyed))
+	rowOrigins := make([][]int, 0, len(result)+len(unkeyed))
 	for _, row := range result {
+		rowOrigins = append(rowOrigins, row.origins)
 		if !row.value.IsValid() {
 			deduplicated = append(deduplicated, row.original)
 			continue
@@ -769,7 +822,16 @@ func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields [
 		}
 		deduplicated = append(deduplicated, UpdateItem[T]{Item: item, UpdateFields: fields})
 	}
-	return append(deduplicated, unkeyed...), nil
+	return append(deduplicated, unkeyed...), append(rowOrigins, unkeyedOrigins...), nil
+}
+
+func containsInt(values []int, v int) bool {
+	for _, x := range values {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // buildCompositeKey returns a composite key for records with non-zero PKs, or empty string for zero PKs
