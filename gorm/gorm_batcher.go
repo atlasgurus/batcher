@@ -436,13 +436,7 @@ func executeIndividualUpdates[T any](
 	// Determine fields to update
 	fieldsToUpdate := updateItem.UpdateFields
 	if len(fieldsToUpdate) == 0 {
-		// Update all fields except the primary key
-		for i := 0; i < itemType.NumField(); i++ {
-			field := itemType.Field(i)
-			if !isPrimaryKey(field) {
-				fieldsToUpdate = append(fieldsToUpdate, field.Name)
-			}
-		}
+		fieldsToUpdate = nonPrimaryKeyFieldNames(itemType)
 	}
 
 	// Add UpdatedAt if it exists and isn't already included
@@ -511,13 +505,7 @@ func executeUpdatesBatchAsSeparateStatements[T any](
 
 		fieldsToUpdate := updateItem.UpdateFields
 		if len(fieldsToUpdate) == 0 {
-			// Update all fields except the primary key
-			for i := 0; i < itemType.NumField(); i++ {
-				field := itemType.Field(i)
-				if !isPrimaryKey(field) {
-					fieldsToUpdate = append(fieldsToUpdate, field.Name)
-				}
-			}
+			fieldsToUpdate = nonPrimaryKeyFieldNames(itemType)
 		}
 
 		_, updatedAtExists := itemType.FieldByName("UpdatedAt")
@@ -597,7 +585,10 @@ func batchUpdate[T any](
 		}
 
 		// Replace original slice with deduplicated one
-		allUpdateItems = dedupeUpdateItems(allUpdateItems, primaryKeyFields)
+		allUpdateItems, err = dedupeUpdateItems(allUpdateItems, primaryKeyFields, mapping)
+		if err != nil {
+			return batcher.RepeatErr(len(batches), err)
+		}
 
 		updateFieldsMap := make(map[string]bool)
 		var updateFields []string
@@ -614,13 +605,7 @@ func batchUpdate[T any](
 
 			fieldsToUpdate := updateItem.UpdateFields
 			if len(fieldsToUpdate) == 0 {
-				// Update all fields except the primary key
-				for i := 0; i < itemType.NumField(); i++ {
-					field := itemType.Field(i)
-					if !isPrimaryKey(field) {
-						fieldsToUpdate = append(fieldsToUpdate, field.Name)
-					}
-				}
+				fieldsToUpdate = nonPrimaryKeyFieldNames(itemType)
 			}
 
 			_, updatedAtExists := itemType.FieldByName("UpdatedAt")
@@ -763,58 +748,138 @@ func batchUpdate[T any](
 		return batcher.RepeatErr(len(batches), nil)
 	}
 }
-func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields []reflect.StructField) []UpdateItem[T] {
-	// Track both the latest values and all fields to update for each ID
-	type combinedUpdate struct {
-		item         T
-		updateFields map[string]bool
-	}
-	latestUpdates := make(map[string]combinedUpdate)
 
-	for _, updateItem := range allUpdateItems {
-		item := updateItem.Item
-		itemValue := reflect.ValueOf(item)
-		if itemValue.Kind() == reflect.Ptr {
+// nonPrimaryKeyFieldNames lists the struct fields an update with no explicit
+// field list writes: every field except the primary key.
+func nonPrimaryKeyFieldNames(itemType reflect.Type) []string {
+	var names []string
+	for i := 0; i < itemType.NumField(); i++ {
+		field := itemType.Field(i)
+		if !isPrimaryKey(field) {
+			names = append(names, field.Name)
+		}
+	}
+	return names
+}
+
+// dedupeUpdateItems merges the updates of one row into a single update. The
+// batched UPDATE takes the first CASE branch that matches a row, so without the
+// merge every later update of that row would be dropped.
+//
+// Each update contributes only the fields it names, with the values from its
+// own item, applied in submission order: a field ends with the value of the
+// last update that named it, and a field no update named is not written. An
+// update with no field list names every field except the primary key. Field
+// names may be struct or column names: a field named both ways is one field,
+// and the merged update keeps the spelling of the last update that named it,
+// because batchUpdate treats "UpdatedAt" (current time) and "updated_at" (the
+// item's value) differently.
+//
+// A row updated once keeps its original UpdateItem. A merged row gets a new
+// item; the callers' items are never modified. Rows keep the order in which
+// they were first seen.
+func dedupeUpdateItems[T any](allUpdateItems []UpdateItem[T], primaryKeyFields []reflect.StructField, mapping fieldMapping) ([]UpdateItem[T], error) {
+	type namedField struct {
+		structName string // the field the value is copied from and to
+		spelling   string // the name as the caller gave it
+	}
+	type mergedRow struct {
+		original UpdateItem[T]     // the row's first update, used as is if it stays alone
+		value    reflect.Value     // addressable copy of the row, once a second update arrives
+		fields   []string          // struct field names named so far, in first-named order
+		spelling map[string]string // struct field name -> spelling of the last update that named it
+	}
+
+	// namedFields returns the fields an update writes.
+	namedFields := func(u UpdateItem[T], itemValue reflect.Value) ([]namedField, error) {
+		if len(u.UpdateFields) == 0 {
+			all := nonPrimaryKeyFieldNames(itemValue.Type())
+			named := make([]namedField, len(all))
+			for i, name := range all {
+				named[i] = namedField{structName: name, spelling: name}
+			}
+			return named, nil
+		}
+		named := make([]namedField, 0, len(u.UpdateFields))
+		for _, f := range u.UpdateFields {
+			structName, _, err := getFieldNames(f, mapping)
+			if err != nil {
+				return nil, err
+			}
+			named = append(named, namedField{structName: structName, spelling: f})
+		}
+		return named, nil
+	}
+
+	rows := make(map[string]*mergedRow)
+	var result []*mergedRow
+	var unkeyed []UpdateItem[T]
+	for _, u := range allUpdateItems {
+		itemValue := reflect.ValueOf(u.Item)
+		if itemValue.Kind() == reflect.Pointer {
 			itemValue = itemValue.Elem()
 		}
-
-		// Create composite key for the item
-		var keyParts []string
-		for _, pkField := range primaryKeyFields {
-			keyParts = append(keyParts, fmt.Sprint(itemValue.FieldByName(pkField.Name).Interface()))
+		key, ok := buildCompositeKey(itemValue, primaryKeyFields)
+		if !ok {
+			// A zero primary key names no particular row; nothing to merge.
+			unkeyed = append(unkeyed, u)
+			continue
 		}
-		compositeKey := strings.Join(keyParts, "-")
+		fields, err := namedFields(u, itemValue)
+		if err != nil {
+			return nil, err
+		}
 
-		// Get or create the combined update
-		combined, exists := latestUpdates[compositeKey]
-		if !exists {
-			combined = combinedUpdate{
-				item:         item,
-				updateFields: make(map[string]bool),
+		row, seen := rows[key]
+		if !seen {
+			row = &mergedRow{original: u, spelling: make(map[string]string)}
+			rows[key] = row
+			result = append(result, row)
+		} else {
+			if !row.value.IsValid() {
+				// Second update of this row: start from a copy of the first.
+				first := reflect.ValueOf(row.original.Item)
+				if first.Kind() == reflect.Pointer {
+					first = first.Elem()
+				}
+				row.value = reflect.New(first.Type()).Elem()
+				row.value.Set(first)
+			}
+			for _, f := range fields {
+				dst := row.value.FieldByName(f.structName)
+				if !dst.CanSet() {
+					return nil, fmt.Errorf("field %s cannot be set when merging updates of one row", f.structName)
+				}
+				dst.Set(itemValue.FieldByName(f.structName))
 			}
 		}
-		// Keep the latest value
-		combined.item = item
-		// Merge the fields to update
-		for _, field := range updateItem.UpdateFields {
-			combined.updateFields[field] = true
+		for _, f := range fields {
+			if _, named := row.spelling[f.structName]; !named {
+				row.fields = append(row.fields, f.structName)
+			}
+			row.spelling[f.structName] = f.spelling
 		}
-		latestUpdates[compositeKey] = combined
 	}
 
-	// Convert back to UpdateItems
-	deduplicatedItems := make([]UpdateItem[T], 0, len(latestUpdates))
-	for _, combined := range latestUpdates {
-		fields := make([]string, 0, len(combined.updateFields))
-		for field := range combined.updateFields {
-			fields = append(fields, field)
+	deduplicated := make([]UpdateItem[T], 0, len(result)+len(unkeyed))
+	for _, row := range result {
+		if !row.value.IsValid() {
+			deduplicated = append(deduplicated, row.original)
+			continue
 		}
-		deduplicatedItems = append(deduplicatedItems, UpdateItem[T]{
-			Item:         combined.item,
-			UpdateFields: fields,
-		})
+		var item T
+		if reflect.TypeOf(row.original.Item).Kind() == reflect.Pointer {
+			item = row.value.Addr().Interface().(T)
+		} else {
+			item = row.value.Interface().(T)
+		}
+		fields := make([]string, len(row.fields))
+		for i, name := range row.fields {
+			fields[i] = row.spelling[name]
+		}
+		deduplicated = append(deduplicated, UpdateItem[T]{Item: item, UpdateFields: fields})
 	}
-	return deduplicatedItems
+	return append(deduplicated, unkeyed...), nil
 }
 
 // buildCompositeKey returns a composite key for records with non-zero PKs, or empty string for zero PKs
@@ -829,7 +894,9 @@ func buildCompositeKey(itemValue reflect.Value, primaryKeyFields []reflect.Struc
 
 	for _, pkField := range primaryKeyFields {
 		fieldValue := itemValue.FieldByName(pkField.Name)
-		keyParts = append(keyParts, fmt.Sprint(fieldValue.Interface()))
+		// Length-prefixed, so ("a-b", "c") and ("a", "b-c") stay distinct keys.
+		part := fmt.Sprint(fieldValue.Interface())
+		keyParts = append(keyParts, strconv.Itoa(len(part))+":"+part)
 
 		// Check if field is zero value (for auto-increment PKs)
 		if fieldValue.IsZero() {
