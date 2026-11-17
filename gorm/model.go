@@ -112,7 +112,10 @@ func (m *modelInfo) primaryKeyStructFields() []reflect.StructField {
 // parser does not treat as indexes. Primary key fields are left out.
 func uniqueIndexesOf(s *schema.Schema) [][]*schema.Field {
 	byName := map[string][]*schema.Field{}
-	for name, idx := range s.ParseIndexes() {
+	// ParseIndexes returns map[string]Index keyed by index name up to GORM
+	// 1.25 and []*Index from GORM 1.26; reading idx.Name compiles on both.
+	for _, idx := range s.ParseIndexes() {
+		name := idx.Name
 		if idx.Class != "UNIQUE" {
 			continue
 		}
