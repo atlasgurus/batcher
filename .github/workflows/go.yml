@@ -145,3 +145,32 @@ jobs:
         env:
           DSN: ${{ env.DSN }}
           DIALECT: ${{ env.DIALECT }}
+
+  # go.mod keeps the lowest GORM version batcher supports, so the jobs above
+  # never compile against the GORM most consumers run. This job builds and
+  # tests against the newest GORM release so an API change there fails here.
+  test-gorm-latest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23'
+      - name: Set up SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 libsqlite3-dev
+      - name: Upgrade GORM to the latest release
+        run: |
+          go get gorm.io/gorm@latest
+          go mod tidy
+          go list -m gorm.io/gorm
+      - name: Build
+        run: go build -tags sqlite -v ./...
+      - name: Test
+        run: go test -tags sqlite -short -v ./...
+        env:
+          DSN: file:test.db?cache=shared&mode=memory
+          DIALECT: sqlite3
